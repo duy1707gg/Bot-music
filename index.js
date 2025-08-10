@@ -1,4 +1,4 @@
-// index.js — Discord music bot (youtube-dl-exec + cookies via env, robust fallbacks)
+// index.js — Discord music bot (no YT_COOKIE, robust fallbacks)
 
 import {
     AudioPlayerStatus,
@@ -20,19 +20,6 @@ import {
 import 'dotenv/config';
 import play from 'play-dl';
 import SpotifyWebApi from 'spotify-web-api-node';
-
-import fs from 'node:fs';
-import { create as createYtdlp } from 'youtube-dl-exec';
-
-// ====== Tạo cookies.txt từ ENV (Railway Variables: YT_COOKIE_CONTENT) ======
-if (process.env.YT_COOKIE_CONTENT) {
-    try {
-        fs.writeFileSync('./cookies.txt', process.env.YT_COOKIE_CONTENT);
-        console.log('✅ cookies.txt created from env');
-    } catch (e) {
-        console.warn('⚠️ Cannot write cookies.txt from env:', e?.message || e);
-    }
-}
 
 // ================= Helpers: YouTube search matcher =================
 function parseDurationStr(s) {
@@ -65,21 +52,29 @@ function channelPriority(name = '') {
 function scoreResult({ title, channel, durationSec }, want) {
     const D = want.durationSec ?? null;
     let score = 0;
+
+    // độ lệch thời lượng
     if (D != null && durationSec != null) {
         const diff = Math.abs(durationSec - D);
         score += diff <= 3 ? 0 : diff <= 6 ? 1 : diff <= 10 ? 3 : diff <= 20 ? 8 : 20 + Math.floor((diff - 20) / 5);
     } else {
         score += 5;
     }
+
+    // phạt tiêu đề kém
     if (titleLooksBad(title)) score += 8;
     score += channelPriority(channel);
 
+    // phủ token
     const t = normalize(title);
-    const wantTokens = (normalize(want.track) + ' ' + normalize(want.artist)).split(' ').filter(Boolean);
+    const wantTokens = (normalize(want.track) + ' ' + normalize(want.artist))
+        .split(' ')
+        .filter(Boolean);
     const covered = wantTokens.filter(tok => t.includes(tok)).length;
     const coverage = covered / Math.max(1, wantTokens.length);
     score += (1 - coverage) * 6;
     score -= coverage * 1.5;
+
     return score;
 }
 async function bestYouTubeForTrack({ track, artist, durationMs }) {
@@ -137,7 +132,7 @@ const spotify = new SpotifyWebApi({
 });
 let spotifyTokenExpiry = 0;
 async function ensureSpotifyToken() {
-    if (!spotify.getClientId() || !spotify.getClientSecret()) return;
+    if (!spotify.getClientId() || !spotify.getClientSecret()) return; // cho phép thiếu Spotify
     const now = Date.now();
     if (now < spotifyTokenExpiry - 10_000) return;
     const data = await spotify.clientCredentialsGrant();
@@ -166,6 +161,7 @@ async function resolveSpotifyToYoutubeUrls(spotifyUrl) {
         const t = (await spotify.getTrack(info.id)).body;
         const best = await bestYouTubeForTrack({ track: t.name, artist: t.artists?.[0]?.name || '', durationMs: t.duration_ms });
         if (best) urls.push(best);
+
     } else if (info.type === 'album') {
         const album = (await spotify.getAlbum(info.id)).body;
         let offset = 0, limit = 50;
@@ -182,6 +178,7 @@ async function resolveSpotifyToYoutubeUrls(spotifyUrl) {
             }
             offset += page.items.length;
         }
+
     } else if (info.type === 'playlist') {
         let offset = 0, limit = 100, total = 0;
         do {
@@ -249,22 +246,6 @@ function printNowPlaying(titleOrUrl) {
     console.log(`🎶 Now Playing: ${titleOrUrl}`);
 }
 
-// ================= youtube-dl-exec (yt-dlp) helper =================
-const ytdlp = createYtdlp('yt-dlp'); // auto tải yt-dlp binary
-
-function spawnYtDlp(url) {
-    const args = {
-        format: 'bestaudio[ext=m4a]/bestaudio/best',
-        output: '-',
-        noPlaylist: true,
-        quiet: true,
-        noWarnings: true,
-    };
-    if (fs.existsSync('./cookies.txt')) args.cookies = './cookies.txt';
-    // trả về child process có stdout stream
-    return ytdlp(url, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-}
-
 // ================= Core stream helpers =================
 async function createResourceFromUrl(urlInput) {
     let finalUrl = urlInput;
@@ -272,23 +253,7 @@ async function createResourceFromUrl(urlInput) {
     // YouTube chuẩn hoá
     if (/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//i.test(finalUrl)) {
         finalUrl = await resolveYouTubePlayableUrl(finalUrl);
-
-        // Try 1: yt-dlp (ưu tiên, đặc biệt khi có cookies)
-        try {
-            const proc = spawnYtDlp(finalUrl);
-            proc.stderr?.on('data', d => {
-                const s = d.toString();
-                if (s && /ERROR|WARN/i.test(s)) console.warn('[yt-dlp]', s.trim());
-            });
-            return {
-                resource: createAudioResource(proc.stdout, { inputType: StreamType.Arbitrary, inlineVolume: true }),
-                display: finalUrl,
-            };
-        } catch (e) {
-            console.warn('[yt-dlp] failed, fallback play-dl:', e?.message || e);
-        }
-
-        // Try 2: play-dl
+        // Try 1: play-dl
         try {
             const info = await play.stream(finalUrl, { quality: 2 });
             return {
@@ -296,10 +261,10 @@ async function createResourceFromUrl(urlInput) {
                 display: finalUrl,
             };
         } catch (e) {
-            console.warn('[play-dl] fail, fallback ytdl:', e?.message || e);
+            console.warn('[play-dl] direct stream failed, fallback ytdl:', e?.message || e);
         }
 
-        // Try 3: ytdl-core
+        // Try 2: ytdl
         try {
             const ytStream = ytdl(finalUrl, {
                 filter: 'audioonly',
@@ -318,14 +283,14 @@ async function createResourceFromUrl(urlInput) {
                 display: finalUrl,
             };
         } catch (e) {
-            console.warn('[ytdl-core] failed:', e?.message || e);
+            console.warn('[ytdl] failed:', e?.message || e);
         }
 
-        // Try 4: mirror search → play-dl
+        // Try 3: mirror search theo tiêu đề và stream bằng play-dl
         try {
             const title = await fetchTitleWithTimeout(finalUrl, 2000);
             const candidates = await play.search(title, { source: { youtube: 'video' }, limit: 6 }).catch(() => []);
-            for (const c of (candidates || [])) {
+            for (const c of candidates || []) {
                 try {
                     const info2 = await play.stream(c.url, { quality: 2 });
                     return {
@@ -338,7 +303,7 @@ async function createResourceFromUrl(urlInput) {
             console.warn('[mirror-search] failed:', e?.message || e);
         }
 
-        throw new Error('Không stream được từ YouTube (yt-dlp/play-dl/ytdl/mirror đều fail).');
+        throw new Error('Không stream được từ YouTube (đã thử nhiều cách).');
     }
 
     // Spotify → đổi sang YouTube (playlist/album: lấy bài đầu để phát ngay)
@@ -366,6 +331,7 @@ async function createResourceFromUrl(urlInput) {
 
 // Mở rộng URL thành danh sách (playlist YouTube/Spotify)
 async function expandToUrls(rawUrl) {
+    // YouTube
     if (/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//i.test(rawUrl)) {
         const { v, list } = getYTParams(rawUrl);
         if (v && !list) return [await resolveYouTubePlayableUrl(rawUrl)];
@@ -375,9 +341,11 @@ async function expandToUrls(rawUrl) {
             return vids.map(v => v.url);
         }
     }
+    // Spotify
     if (/^(https?:\/\/)?open\.spotify\.com\//i.test(rawUrl)) {
         return await resolveSpotifyToYoutubeUrls(rawUrl);
     }
+    // Nguồn khác
     return [rawUrl];
 }
 
@@ -411,11 +379,12 @@ function getOrCreate(guild, voiceChannel) {
         ctx = { player, connection, queue: [], now: null, textChannelId: undefined };
         contexts.set(guild.id, ctx);
 
+        // Hết bài → phát tiếp từ queue
         player.on(AudioPlayerStatus.Idle, async () => {
             try {
                 if (ctx.queue.length > 0) {
                     const next = ctx.queue.shift();
-                    await playOne(ctx, next.url, { announce: true });
+                    await playOne(ctx, next.url, { announce: true }); // gửi announce im lặng
                 } else {
                     ctx.now = null;
                 }
@@ -427,6 +396,7 @@ function getOrCreate(guild, voiceChannel) {
 
         player.on('error', (err) => console.error('[PLAYER] error:', err));
 
+        // Log khi player vào trạng thái Playing
         player.on(AudioPlayerStatus.Playing, () => {
             const titleOrUrl = ctx.now?.title || ctx.now?.url || '(unknown)';
             printNowPlaying(titleOrUrl);
@@ -442,6 +412,7 @@ async function announceNowPlaying(client, ctx) {
         if (!ch || !('send' in ch)) return;
         const title = ctx.now.title || ctx.now.url;
 
+        // gửi tin nhắn im lặng (không ting)
         await ch.send({
             content: `🎶 **Now Playing:** ${title}`,
             flags: MessageFlags.SuppressNotifications,
@@ -453,15 +424,27 @@ async function announceNowPlaying(client, ctx) {
 
 async function playOne(ctx, url, { announce = false } = {}) {
     const { resource, display } = await createResourceFromUrl(url);
+
+    // gắn trước để listener Playing đọc được
     ctx.now = { url: display, title: undefined };
+
+    // phát trước
     ctx.player.play(resource);
 
+    // lấy tiêu đề có timeout (2s), nếu fail dùng URL
     let title = display;
-    try { title = await fetchTitleWithTimeout(display, 2000); } catch { }
+    try {
+        title = await fetchTitleWithTimeout(display, 2000);
+    } catch (_) { }
     ctx.now.title = title;
 
+    // in ra console
     printNowPlaying(title);
-    if (announce) await announceNowPlaying(client, ctx);
+
+    // gửi thông báo (im lặng) nếu announce=true
+    if (announce) {
+        await announceNowPlaying(client, ctx);
+    }
 }
 
 // ================ Bot setup & commands ================
@@ -500,7 +483,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 ctx.textChannelId = interaction.channelId;
             }
 
-            ctx.queue.length = 0;
+            ctx.queue.length = 0; // clear queue
             await playOne(ctx, inputUrl, { announce: true });
             return interaction.editReply(`🎵 Đang phát: ${ctx.now?.title || ctx.now?.url}`);
         } catch (err) {
@@ -533,6 +516,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
             const urls = await expandToUrls(inputUrl);
 
+            // lấy sẵn tiêu đề cho 10 bài đầu để hiển thị đẹp
             const firstTitlesCount = Math.min(urls.length, 10);
             const titles = await Promise.all(urls.slice(0, firstTitlesCount).map(u => fetchTitle(u)));
             const items = urls.map((u, idx) => ({ url: u, title: idx < firstTitlesCount ? titles[idx] : undefined }));
@@ -558,7 +542,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!ctx || (!ctx.now && ctx.queue.length === 0)) {
             return interaction.reply({ content: '⏭️ Không có gì để skip.', ephemeral: true });
         }
-        ctx.player.stop(true);
+        ctx.player.stop(true); // Idle → auto next
         return interaction.reply('⏭️ Đã skip.');
     }
 
