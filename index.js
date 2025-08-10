@@ -258,12 +258,18 @@ async function createResourceFromUrl(urlInput) {
             filter: 'audioonly',
             quality: 'highestaudio',
             highWaterMark: 1 << 25,
+            requestOptions: {
+                headers: {
+                    cookie: process.env.YT_COOKIE // 👈 dùng cookie từ .env
+                }
+            }
         });
         return {
             resource: createAudioResource(ytStream, { inputType: StreamType.Arbitrary, inlineVolume: true }),
             display: finalUrl,
         };
     }
+    
 
     // Nguồn khác: thử play-dl
     const kind = await play.validate(finalUrl);
