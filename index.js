@@ -1,4 +1,4 @@
-// index.js — Discord music bot (yt-dlp + cookies.txt via env, robust fallbacks)
+// index.js — Discord music bot (youtube-dl-exec + cookies via env, robust fallbacks)
 
 import {
     AudioPlayerStatus,
@@ -22,7 +22,7 @@ import play from 'play-dl';
 import SpotifyWebApi from 'spotify-web-api-node';
 
 import fs from 'node:fs';
-import ytdlp from 'yt-dlp-exec'; // nhúng yt-dlp (không cần apt/pip)
+import { create as createYtdlp } from 'youtube-dl-exec';
 
 // ====== Tạo cookies.txt từ ENV (Railway Variables: YT_COOKIE_CONTENT) ======
 if (process.env.YT_COOKIE_CONTENT) {
@@ -80,7 +80,6 @@ function scoreResult({ title, channel, durationSec }, want) {
     const coverage = covered / Math.max(1, wantTokens.length);
     score += (1 - coverage) * 6;
     score -= coverage * 1.5;
-
     return score;
 }
 async function bestYouTubeForTrack({ track, artist, durationMs }) {
@@ -250,7 +249,9 @@ function printNowPlaying(titleOrUrl) {
     console.log(`🎶 Now Playing: ${titleOrUrl}`);
 }
 
-// ================= yt-dlp helper (ưu tiên nếu có cookies) =================
+// ================= youtube-dl-exec (yt-dlp) helper =================
+const ytdlp = createYtdlp('yt-dlp'); // auto tải yt-dlp binary
+
 function spawnYtDlp(url) {
     const args = {
         format: 'bestaudio[ext=m4a]/bestaudio/best',
@@ -260,7 +261,7 @@ function spawnYtDlp(url) {
         noWarnings: true,
     };
     if (fs.existsSync('./cookies.txt')) args.cookies = './cookies.txt';
-    // trả về child_process promise-like có .stdout stream
+    // trả về child process có stdout stream
     return ytdlp(url, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
@@ -274,8 +275,8 @@ async function createResourceFromUrl(urlInput) {
 
         // Try 1: yt-dlp (ưu tiên, đặc biệt khi có cookies)
         try {
-            const proc = await spawnYtDlp(finalUrl);
-            proc.stderr?.on?.('data', d => {
+            const proc = spawnYtDlp(finalUrl);
+            proc.stderr?.on('data', d => {
                 const s = d.toString();
                 if (s && /ERROR|WARN/i.test(s)) console.warn('[yt-dlp]', s.trim());
             });
