@@ -1,6 +1,9 @@
+// index.js — Discord music bot (no YT_COOKIE, robust fallbacks)
+
 import {
     AudioPlayerStatus,
-    createAudioPlayer, createAudioResource,
+    createAudioPlayer,
+    createAudioResource,
     getVoiceConnection,
     joinVoiceChannel,
     NoSubscriberBehavior,
@@ -9,28 +12,15 @@ import {
 import ytdl from '@distube/ytdl-core';
 import {
     ChannelType,
-    Client, Events, GatewayIntentBits,
-    MessageFlags, // 👈 dùng để gửi tin nhắn im lặng
+    Client,
+    Events,
+    GatewayIntentBits,
+    MessageFlags,
 } from 'discord.js';
 import 'dotenv/config';
 import play from 'play-dl';
 import SpotifyWebApi from 'spotify-web-api-node';
 
-// Nếu từng gặp lỗi FFmpeg not found, mở 2 dòng dưới (hoặc gán path ffmpeg thủ công):
-// import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
-// process.env.FFMPEG_PATH = ffmpegInstaller.path; // hoặc: 'C:\\ffmpeg\\bin\\ffmpeg.exe'
-try {
-    if (process.env.YT_COOKIE) {
-        await play.setToken({
-            youtube: { cookie: process.env.YT_COOKIE }
-        });
-        console.log('[YT] cookie loaded for play-dl');
-    } else {
-        console.warn('[YT] YT_COOKIE not set');
-    }
-} catch (e) {
-    console.warn('[YT] setToken failed:', e?.message || e);
-}
 // ================= Helpers: YouTube search matcher =================
 function parseDurationStr(s) {
     if (!s) return null;
@@ -62,17 +52,24 @@ function channelPriority(name = '') {
 function scoreResult({ title, channel, durationSec }, want) {
     const D = want.durationSec ?? null;
     let score = 0;
+
+    // độ lệch thời lượng
     if (D != null && durationSec != null) {
         const diff = Math.abs(durationSec - D);
         score += diff <= 3 ? 0 : diff <= 6 ? 1 : diff <= 10 ? 3 : diff <= 20 ? 8 : 20 + Math.floor((diff - 20) / 5);
     } else {
         score += 5;
     }
+
+    // phạt tiêu đề kém
     if (titleLooksBad(title)) score += 8;
     score += channelPriority(channel);
 
+    // phủ token
     const t = normalize(title);
-    const wantTokens = (normalize(want.track) + ' ' + normalize(want.artist)).split(' ').filter(Boolean);
+    const wantTokens = (normalize(want.track) + ' ' + normalize(want.artist))
+        .split(' ')
+        .filter(Boolean);
     const covered = wantTokens.filter(tok => t.includes(tok)).length;
     const coverage = covered / Math.max(1, wantTokens.length);
     score += (1 - coverage) * 6;
@@ -135,6 +132,7 @@ const spotify = new SpotifyWebApi({
 });
 let spotifyTokenExpiry = 0;
 async function ensureSpotifyToken() {
+    if (!spotify.getClientId() || !spotify.getClientSecret()) return; // cho phép thiếu Spotify
     const now = Date.now();
     if (now < spotifyTokenExpiry - 10_000) return;
     const data = await spotify.clientCredentialsGrant();
@@ -156,7 +154,7 @@ async function resolveSpotifyToYoutubeUrls(spotifyUrl) {
     const info = parseSpotifyId(spotifyUrl);
     if (!info) return [spotifyUrl];
 
-    await ensureSpotifyToken();
+    await ensureSpotifyToken().catch(() => { });
 
     const urls = [];
     if (info.type === 'track') {
@@ -252,10 +250,9 @@ function printNowPlaying(titleOrUrl) {
 async function createResourceFromUrl(urlInput) {
     let finalUrl = urlInput;
 
-    // YouTube → chuẩn hoá
-    // YouTube URL?
+    // YouTube chuẩn hoá
     if (/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//i.test(finalUrl)) {
-        // Try 1: play-dl (dùng cookie)
+        // Try 1: play-dl
         try {
             const info = await play.stream(finalUrl, { quality: 2 });
             return {
@@ -266,17 +263,13 @@ async function createResourceFromUrl(urlInput) {
             console.warn('[play-dl] direct stream failed, fallback ytdl:', e?.message || e);
         }
 
-        // Try 2: ytdl (có gắn cookie header nếu bạn đặt YT_COOKIE)
+        // Try 2: ytdl
         try {
-            const ytdlOpts = {
+            const ytStream = ytdl(finalUrl, {
                 filter: 'audioonly',
                 quality: 'highestaudio',
                 highWaterMark: 1 << 25,
-            };
-            if (process.env.YT_COOKIE) {
-                ytdlOpts.requestOptions = { headers: { cookie: process.env.YT_COOKIE } };
-            }
-            const ytStream = ytdl(finalUrl, ytdlOpts);
+            });
             return {
                 resource: createAudioResource(ytStream, { inputType: StreamType.Arbitrary, inlineVolume: true }),
                 display: finalUrl,
@@ -285,7 +278,7 @@ async function createResourceFromUrl(urlInput) {
             console.warn('[ytdl] failed:', e?.message || e);
         }
 
-        // Try 3: tìm mirror theo tiêu đề rồi stream bằng play-dl
+        // Try 3: mirror search theo tiêu đề và stream bằng play-dl
         try {
             const title = await fetchTitleWithTimeout(finalUrl, 2000);
             const candidates = await play.search(title, { source: { youtube: 'video' }, limit: 6 }).catch(() => []);
@@ -302,18 +295,14 @@ async function createResourceFromUrl(urlInput) {
             console.warn('[mirror-search] failed:', e?.message || e);
         }
 
-        throw new Error('YouTube bị chặn: cần YT_COOKIE hợp lệ hoặc thử link khác.');
+        throw new Error('Không stream được từ YouTube (đã thử nhiều cách).');
     }
 
-
-    // Spotify → đổi sang YouTube (nếu playlist/album: lấy bài đầu để phát ngay)
+    // Spotify → đổi sang YouTube (playlist/album: lấy bài đầu để phát ngay)
     if (/^(https?:\/\/)?open\.spotify\.com\//i.test(urlInput)) {
         const ytUrls = await resolveSpotifyToYoutubeUrls(urlInput);
         finalUrl = ytUrls[0];
     }
-
-
-
 
     // Nguồn khác: thử play-dl
     const kind = await play.validate(finalUrl);
@@ -337,7 +326,7 @@ async function expandToUrls(rawUrl) {
     // YouTube
     if (/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//i.test(rawUrl)) {
         const { v, list } = getYTParams(rawUrl);
-        if (v && !list) return [rawUrl];
+        if (v && !list) return [await resolveYouTubePlayableUrl(rawUrl)];
         if (list) {
             const pl = await play.playlist_info(rawUrl, { incomplete: true });
             const vids = await pl.all_videos();
@@ -382,12 +371,12 @@ function getOrCreate(guild, voiceChannel) {
         ctx = { player, connection, queue: [], now: null, textChannelId: undefined };
         contexts.set(guild.id, ctx);
 
-        // Khi hết bài → phát tiếp từ queue (announce lên kênh nhưng im lặng)
+        // Hết bài → phát tiếp từ queue
         player.on(AudioPlayerStatus.Idle, async () => {
             try {
                 if (ctx.queue.length > 0) {
                     const next = ctx.queue.shift();
-                    await playOne(ctx, next.url, { announce: true }); // 👈 vẫn announce nhưng sẽ suppress notifications
+                    await playOne(ctx, next.url, { announce: true }); // gửi announce im lặng
                 } else {
                     ctx.now = null;
                 }
@@ -399,7 +388,7 @@ function getOrCreate(guild, voiceChannel) {
 
         player.on('error', (err) => console.error('[PLAYER] error:', err));
 
-        // Log khi player thực sự vào trạng thái Playing
+        // Log khi player vào trạng thái Playing
         player.on(AudioPlayerStatus.Playing, () => {
             const titleOrUrl = ctx.now?.title || ctx.now?.url || '(unknown)';
             printNowPlaying(titleOrUrl);
@@ -415,7 +404,7 @@ async function announceNowPlaying(client, ctx) {
         if (!ch || !('send' in ch)) return;
         const title = ctx.now.title || ctx.now.url;
 
-        // 👇 gửi tin nhắn im lặng (không ting)
+        // gửi tin nhắn im lặng (không ting)
         await ch.send({
             content: `🎶 **Now Playing:** ${title}`,
             flags: MessageFlags.SuppressNotifications,
@@ -438,10 +427,10 @@ async function playOne(ctx, url, { announce = false } = {}) {
     let title = display;
     try {
         title = await fetchTitleWithTimeout(display, 2000);
-    } catch (_) { /* ignore */ }
+    } catch (_) { }
     ctx.now.title = title;
 
-    // in ra console một dòng chuẩn
+    // in ra console
     printNowPlaying(title);
 
     // gửi thông báo (im lặng) nếu announce=true
@@ -478,7 +467,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             }
 
             let ctx = getOrCreate(guild, voiceChannel);
-            ctx.textChannelId = interaction.channelId; // nhớ kênh
+            ctx.textChannelId = interaction.channelId;
             if (ctx.connection.joinConfig.channelId !== voiceChannel.id) {
                 ctx.connection.destroy();
                 contexts.delete(guild.id);
@@ -487,7 +476,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             }
 
             ctx.queue.length = 0; // clear queue
-            await playOne(ctx, inputUrl, { announce: true }); // 👈 bật announce (im lặng)
+            await playOne(ctx, inputUrl, { announce: true });
             return interaction.editReply(`🎵 Đang phát: ${ctx.now?.title || ctx.now?.url}`);
         } catch (err) {
             console.error('[PLAY] error:', err);
@@ -528,7 +517,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
             if (!ctx.now && ctx.queue.length > 0 && ctx.player.state.status !== AudioPlayerStatus.Playing) {
                 const first = ctx.queue.shift();
-                await playOne(ctx, first.url, { announce: true }); // 👈 bật announce (im lặng)
+                await playOne(ctx, first.url, { announce: true });
                 return interaction.editReply(`➕ Thêm **${urls.length}** mục. 🎵 Đang phát: ${ctx.now?.title || ctx.now?.url}`);
             }
 
@@ -545,7 +534,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!ctx || (!ctx.now && ctx.queue.length === 0)) {
             return interaction.reply({ content: '⏭️ Không có gì để skip.', ephemeral: true });
         }
-        ctx.player.stop(true); // sẽ kích hoạt Idle và tự next (announce im lặng)
+        ctx.player.stop(true); // Idle → auto next
         return interaction.reply('⏭️ Đã skip.');
     }
 
@@ -596,6 +585,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.deferReply({ ephemeral: false });
         const page = interaction.options.getInteger('page') || 1;
         const perPage = 10;
+
         const startIndex = (Math.max(1, page) - 1) * perPage;
         const slice = ctx.queue.slice(startIndex, startIndex + perPage);
 
