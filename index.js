@@ -10,6 +10,7 @@ import ytdl from '@distube/ytdl-core';
 import {
     ChannelType,
     Client, Events, GatewayIntentBits,
+    MessageFlags, // 👈 dùng để gửi tin nhắn im lặng
 } from 'discord.js';
 import 'dotenv/config';
 import play from 'play-dl';
@@ -331,12 +332,12 @@ function getOrCreate(guild, voiceChannel) {
         ctx = { player, connection, queue: [], now: null, textChannelId: undefined };
         contexts.set(guild.id, ctx);
 
-        // Khi hết bài → phát tiếp từ queue (im lặng trên kênh nhưng vẫn log)
+        // Khi hết bài → phát tiếp từ queue (announce lên kênh nhưng im lặng)
         player.on(AudioPlayerStatus.Idle, async () => {
             try {
                 if (ctx.queue.length > 0) {
                     const next = ctx.queue.shift();
-                    await playOne(ctx, next.url, { announce: false });
+                    await playOne(ctx, next.url, { announce: true }); // 👈 vẫn announce nhưng sẽ suppress notifications
                 } else {
                     ctx.now = null;
                 }
@@ -363,7 +364,12 @@ async function announceNowPlaying(client, ctx) {
         const ch = await client.channels.fetch(ctx.textChannelId).catch(() => null);
         if (!ch || !('send' in ch)) return;
         const title = ctx.now.title || ctx.now.url;
-        await ch.send(`🎶 **Now Playing:** ${title}`);
+
+        // 👇 gửi tin nhắn im lặng (không ting)
+        await ch.send({
+            content: `🎶 **Now Playing:** ${title}`,
+            flags: MessageFlags.SuppressNotifications,
+        });
     } catch (e) {
         console.error('[ANNOUNCE] error:', e);
     }
@@ -388,7 +394,7 @@ async function playOne(ctx, url, { announce = false } = {}) {
     // in ra console một dòng chuẩn
     printNowPlaying(title);
 
-    // không thông báo ra kênh nếu announce=false
+    // gửi thông báo (im lặng) nếu announce=true
     if (announce) {
         await announceNowPlaying(client, ctx);
     }
@@ -422,7 +428,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             }
 
             let ctx = getOrCreate(guild, voiceChannel);
-            ctx.textChannelId = interaction.channelId; // nhớ kênh (nếu sau này muốn announce)
+            ctx.textChannelId = interaction.channelId; // nhớ kênh
             if (ctx.connection.joinConfig.channelId !== voiceChannel.id) {
                 ctx.connection.destroy();
                 contexts.delete(guild.id);
@@ -431,7 +437,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             }
 
             ctx.queue.length = 0; // clear queue
-            await playOne(ctx, inputUrl, { announce: false }); // không gửi ra kênh
+            await playOne(ctx, inputUrl, { announce: true }); // 👈 bật announce (im lặng)
             return interaction.editReply(`🎵 Đang phát: ${ctx.now?.title || ctx.now?.url}`);
         } catch (err) {
             console.error('[PLAY] error:', err);
@@ -472,7 +478,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
             if (!ctx.now && ctx.queue.length > 0 && ctx.player.state.status !== AudioPlayerStatus.Playing) {
                 const first = ctx.queue.shift();
-                await playOne(ctx, first.url, { announce: false }); // không gửi ra kênh
+                await playOne(ctx, first.url, { announce: true }); // 👈 bật announce (im lặng)
                 return interaction.editReply(`➕ Thêm **${urls.length}** mục. 🎵 Đang phát: ${ctx.now?.title || ctx.now?.url}`);
             }
 
@@ -489,7 +495,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!ctx || (!ctx.now && ctx.queue.length === 0)) {
             return interaction.reply({ content: '⏭️ Không có gì để skip.', ephemeral: true });
         }
-        ctx.player.stop(true); // sẽ kích hoạt Idle và tự next
+        ctx.player.stop(true); // sẽ kích hoạt Idle và tự next (announce im lặng)
         return interaction.reply('⏭️ Đã skip.');
     }
 
