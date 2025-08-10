@@ -19,7 +19,18 @@ import SpotifyWebApi from 'spotify-web-api-node';
 // Nếu từng gặp lỗi FFmpeg not found, mở 2 dòng dưới (hoặc gán path ffmpeg thủ công):
 // import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 // process.env.FFMPEG_PATH = ffmpegInstaller.path; // hoặc: 'C:\\ffmpeg\\bin\\ffmpeg.exe'
-
+try {
+    if (process.env.YT_COOKIE) {
+        await play.setToken({
+            youtube: { cookie: process.env.YT_COOKIE }
+        });
+        console.log('[YT] cookie loaded for play-dl');
+    } else {
+        console.warn('[YT] YT_COOKIE not set');
+    }
+} catch (e) {
+    console.warn('[YT] setToken failed:', e?.message || e);
+}
 // ================= Helpers: YouTube search matcher =================
 function parseDurationStr(s) {
     if (!s) return null;
@@ -242,9 +253,58 @@ async function createResourceFromUrl(urlInput) {
     let finalUrl = urlInput;
 
     // YouTube → chuẩn hoá
-    if (/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//i.test(urlInput)) {
-        finalUrl = await resolveYouTubePlayableUrl(urlInput);
+    // YouTube URL?
+    if (/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//i.test(finalUrl)) {
+        // Try 1: play-dl (dùng cookie)
+        try {
+            const info = await play.stream(finalUrl, { quality: 2 });
+            return {
+                resource: createAudioResource(info.stream, { inputType: info.type, inlineVolume: true }),
+                display: finalUrl,
+            };
+        } catch (e) {
+            console.warn('[play-dl] direct stream failed, fallback ytdl:', e?.message || e);
+        }
+
+        // Try 2: ytdl (có gắn cookie header nếu bạn đặt YT_COOKIE)
+        try {
+            const ytdlOpts = {
+                filter: 'audioonly',
+                quality: 'highestaudio',
+                highWaterMark: 1 << 25,
+            };
+            if (process.env.YT_COOKIE) {
+                ytdlOpts.requestOptions = { headers: { cookie: process.env.YT_COOKIE } };
+            }
+            const ytStream = ytdl(finalUrl, ytdlOpts);
+            return {
+                resource: createAudioResource(ytStream, { inputType: StreamType.Arbitrary, inlineVolume: true }),
+                display: finalUrl,
+            };
+        } catch (e) {
+            console.warn('[ytdl] failed:', e?.message || e);
+        }
+
+        // Try 3: tìm mirror theo tiêu đề rồi stream bằng play-dl
+        try {
+            const title = await fetchTitleWithTimeout(finalUrl, 2000);
+            const candidates = await play.search(title, { source: { youtube: 'video' }, limit: 6 }).catch(() => []);
+            for (const c of candidates || []) {
+                try {
+                    const info2 = await play.stream(c.url, { quality: 2 });
+                    return {
+                        resource: createAudioResource(info2.stream, { inputType: info2.type, inlineVolume: true }),
+                        display: c.url,
+                    };
+                } catch { }
+            }
+        } catch (e) {
+            console.warn('[mirror-search] failed:', e?.message || e);
+        }
+
+        throw new Error('YouTube bị chặn: cần YT_COOKIE hợp lệ hoặc thử link khác.');
     }
+
 
     // Spotify → đổi sang YouTube (nếu playlist/album: lấy bài đầu để phát ngay)
     if (/^(https?:\/\/)?open\.spotify\.com\//i.test(urlInput)) {
@@ -269,7 +329,7 @@ async function createResourceFromUrl(urlInput) {
             display: finalUrl,
         };
     }
-    
+
 
     // Nguồn khác: thử play-dl
     const kind = await play.validate(finalUrl);
