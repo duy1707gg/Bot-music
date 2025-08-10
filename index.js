@@ -367,9 +367,9 @@ async function playOne(ctx, url) {
     const title = await fetchTitle(display).catch(() => display);
     ctx.now = { url: display, title };
 
-    console.log('[PLAYER] now playing', title);
-    // gửi thông báo Now Playing
-    await announceNowPlaying(client, ctx);
+    // console.log('[PLAYER] now playing', title);
+    // // gửi thông báo Now Playing
+    // await announceNowPlaying(client, ctx);
 }
 
 // ================ Bot setup & commands ================
