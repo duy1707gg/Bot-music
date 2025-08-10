@@ -332,7 +332,7 @@ function getOrCreate(guild, voiceChannel) {
             try {
                 if (ctx.queue.length > 0) {
                     const next = ctx.queue.shift();
-                    await playOne(ctx, next.url);
+                    await playOne(ctx, next.url,{ announce: false });
                 } else {
                     ctx.now = null;
                 }
@@ -359,17 +359,20 @@ async function announceNowPlaying(client, ctx) {
     }
 }
 
-async function playOne(ctx, url) {
+async function playOne(ctx, url, { announce = false } = {}) {
     const { resource, display } = await createResourceFromUrl(url);
     ctx.player.play(resource);
 
-    // điền tiêu đề “lười” để hiện thông báo đẹp
     const title = await fetchTitle(display).catch(() => display);
     ctx.now = { url: display, title };
 
-    // console.log('[PLAYER] now playing', title);
-    // // gửi thông báo Now Playing
-    // await announceNowPlaying(client, ctx);
+    // vẫn ghi log ra console
+    console.log('[PLAYER] now playing', title);
+
+    // không gửi thông báo ra kênh (announce=false mặc định)
+    if (announce) {
+        await announceNowPlaying(client, ctx);
+    }
 }
 
 // ================ Bot setup & commands ================
