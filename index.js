@@ -312,23 +312,7 @@ async function createResourceFromUrl(urlInput) {
         finalUrl = ytUrls[0];
     }
 
-    // YouTube stream bằng ytdl
-    if (ytdl.validateURL(finalUrl)) {
-        const ytStream = ytdl(finalUrl, {
-            filter: 'audioonly',
-            quality: 'highestaudio',
-            highWaterMark: 1 << 25,
-            requestOptions: {
-                headers: {
-                    cookie: process.env.YT_COOKIE // 👈 dùng cookie từ .env
-                }
-            }
-        });
-        return {
-            resource: createAudioResource(ytStream, { inputType: StreamType.Arbitrary, inlineVolume: true }),
-            display: finalUrl,
-        };
-    }
+
 
 
     // Nguồn khác: thử play-dl
