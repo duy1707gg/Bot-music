@@ -205,10 +205,11 @@ async function fetchTitle(url) {
     } catch (_) { }
     return url;
 }
-function chunk(arr, size) {
-    const out = [];
-    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-    return out;
+async function fetchTitleWithTimeout(url, ms = 2000) {
+    return await Promise.race([
+        (async () => await fetchTitle(url))(),
+        new Promise(resolve => setTimeout(() => resolve(url), ms))
+    ]);
 }
 function formatQueuePage(ctx, page = 1, perPage = 10) {
     const total = ctx.queue.length;
@@ -230,6 +231,9 @@ function shuffleInPlace(arr) {
         const j = Math.floor(Math.random() * (i + 1));
         [arr[i], arr[j]] = [arr[j], arr[i]];
     }
+}
+function printNowPlaying(titleOrUrl) {
+    console.log(`🎶 Now Playing: ${titleOrUrl}`);
 }
 
 // ================= Core stream helpers =================
@@ -327,12 +331,12 @@ function getOrCreate(guild, voiceChannel) {
         ctx = { player, connection, queue: [], now: null, textChannelId: undefined };
         contexts.set(guild.id, ctx);
 
-        // Khi hết bài → phát tiếp từ queue
+        // Khi hết bài → phát tiếp từ queue (im lặng trên kênh nhưng vẫn log)
         player.on(AudioPlayerStatus.Idle, async () => {
             try {
                 if (ctx.queue.length > 0) {
                     const next = ctx.queue.shift();
-                    await playOne(ctx, next.url,{ announce: false });
+                    await playOne(ctx, next.url, { announce: false });
                 } else {
                     ctx.now = null;
                 }
@@ -343,6 +347,12 @@ function getOrCreate(guild, voiceChannel) {
         });
 
         player.on('error', (err) => console.error('[PLAYER] error:', err));
+
+        // Log khi player thực sự vào trạng thái Playing
+        player.on(AudioPlayerStatus.Playing, () => {
+            const titleOrUrl = ctx.now?.title || ctx.now?.url || '(unknown)';
+            printNowPlaying(titleOrUrl);
+        });
     }
     return ctx;
 }
@@ -361,15 +371,24 @@ async function announceNowPlaying(client, ctx) {
 
 async function playOne(ctx, url, { announce = false } = {}) {
     const { resource, display } = await createResourceFromUrl(url);
+
+    // gắn trước để listener Playing đọc được
+    ctx.now = { url: display, title: undefined };
+
+    // phát trước
     ctx.player.play(resource);
 
-    const title = await fetchTitle(display).catch(() => display);
-    ctx.now = { url: display, title };
+    // lấy tiêu đề có timeout (2s), nếu fail dùng URL
+    let title = display;
+    try {
+        title = await fetchTitleWithTimeout(display, 2000);
+    } catch (_) { /* ignore */ }
+    ctx.now.title = title;
 
-    // vẫn ghi log ra console
-    console.log('[PLAYER] now playing', title);
+    // in ra console một dòng chuẩn
+    printNowPlaying(title);
 
-    // không gửi thông báo ra kênh (announce=false mặc định)
+    // không thông báo ra kênh nếu announce=false
     if (announce) {
         await announceNowPlaying(client, ctx);
     }
@@ -403,7 +422,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             }
 
             let ctx = getOrCreate(guild, voiceChannel);
-            ctx.textChannelId = interaction.channelId; // nhớ kênh để thông báo Now Playing
+            ctx.textChannelId = interaction.channelId; // nhớ kênh (nếu sau này muốn announce)
             if (ctx.connection.joinConfig.channelId !== voiceChannel.id) {
                 ctx.connection.destroy();
                 contexts.delete(guild.id);
@@ -412,7 +431,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             }
 
             ctx.queue.length = 0; // clear queue
-            await playOne(ctx, inputUrl);
+            await playOne(ctx, inputUrl, { announce: false }); // không gửi ra kênh
             return interaction.editReply(`🎵 Đang phát: ${ctx.now?.title || ctx.now?.url}`);
         } catch (err) {
             console.error('[PLAY] error:', err);
@@ -453,7 +472,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
             if (!ctx.now && ctx.queue.length > 0 && ctx.player.state.status !== AudioPlayerStatus.Playing) {
                 const first = ctx.queue.shift();
-                await playOne(ctx, first.url);
+                await playOne(ctx, first.url, { announce: false }); // không gửi ra kênh
                 return interaction.editReply(`➕ Thêm **${urls.length}** mục. 🎵 Đang phát: ${ctx.now?.title || ctx.now?.url}`);
             }
 
@@ -470,7 +489,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!ctx || (!ctx.now && ctx.queue.length === 0)) {
             return interaction.reply({ content: '⏭️ Không có gì để skip.', ephemeral: true });
         }
-        ctx.player.stop(true); // sẽ kích hoạt Idle và tự next → announceNowPlaying
+        ctx.player.stop(true); // sẽ kích hoạt Idle và tự next
         return interaction.reply('⏭️ Đã skip.');
     }
 
