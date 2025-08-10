@@ -252,6 +252,7 @@ async function createResourceFromUrl(urlInput) {
 
     // YouTube chuẩn hoá
     if (/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//i.test(finalUrl)) {
+        finalUrl = await resolveYouTubePlayableUrl(finalUrl);
         // Try 1: play-dl
         try {
             const info = await play.stream(finalUrl, { quality: 2 });
@@ -269,6 +270,13 @@ async function createResourceFromUrl(urlInput) {
                 filter: 'audioonly',
                 quality: 'highestaudio',
                 highWaterMark: 1 << 25,
+                requestOptions: {
+                    headers: {
+                        'user-agent':
+                            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+                            '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                    },
+                },
             });
             return {
                 resource: createAudioResource(ytStream, { inputType: StreamType.Arbitrary, inlineVolume: true }),
