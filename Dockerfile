@@ -1,7 +1,10 @@
 FROM node:20-bullseye
 
-# FFmpeg để phát nhạc
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# Cài FFmpeg + Python (yt-dlp-exec cần python trong PATH)
+RUN apt-get update \
+&& apt-get install -y --no-install-recommends ffmpeg python3 ca-certificates curl \
+&& ln -sf /usr/bin/python3 /usr/bin/python \
+&& rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
