@@ -23,6 +23,13 @@ import {
 
 import play from 'play-dl';
 import SpotifyWebApi from 'spotify-web-api-node';
+// Load YouTube cookie from env (optional)
+if (process.env.YT_COOKIE) {
+    await play.setToken({
+        youtube: { cookie: process.env.YT_COOKIE }
+    });
+    console.log('[YT] cookie loaded');
+}
 
 // ================= Helpers: YouTube search matcher =================
 function parseDurationStr(s) {
