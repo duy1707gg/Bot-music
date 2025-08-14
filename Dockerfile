@@ -1,10 +1,14 @@
 FROM node:20-bullseye
 
-# Cài FFmpeg + Python (yt-dlp-exec cần python trong PATH)
+# FFmpeg + công cụ tải (curl) để lấy yt-dlp binary
 RUN apt-get update \
-&& apt-get install -y --no-install-recommends ffmpeg python3 ca-certificates curl \
-&& ln -sf /usr/bin/python3 /usr/bin/python \
-&& rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+
+# Tải yt-dlp (binary, không cần python)
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+     -o /usr/local/bin/yt-dlp \
+ && chmod +x /usr/local/bin/yt-dlp
 
 WORKDIR /app
 

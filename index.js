@@ -1,4 +1,4 @@
-// index.js — Discord music bot (no YT_COOKIE, robust fallbacks)
+// index.js — Discord music bot (RD playlist support via yt-dlp, cookie optional)
 
 import 'dotenv/config';
 
@@ -21,14 +21,17 @@ import {
     MessageFlags,
 } from 'discord.js';
 
+import { execFile } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
 import play from 'play-dl';
 import SpotifyWebApi from 'spotify-web-api-node';
-// Load YouTube cookie from env (optional)
+
+const YTDLP_BIN = '/usr/local/bin/yt-dlp';
+
+// (tuỳ chọn) nạp cookie vào play-dl để giảm CAPTCHA khi stream
 if (process.env.YT_COOKIE) {
-    await play.setToken({
-        youtube: { cookie: process.env.YT_COOKIE }
-    });
-    console.log('[YT] cookie loaded');
+    await play.setToken({ youtube: { cookie: process.env.YT_COOKIE } });
+    console.log('[YT] cookie loaded for play-dl');
 }
 
 // ================= Helpers: YouTube search matcher =================
@@ -63,7 +66,6 @@ function scoreResult({ title, channel, durationSec }, want) {
     const D = want.durationSec ?? null;
     let score = 0;
 
-    // lệch thời lượng
     if (D != null && durationSec != null) {
         const diff = Math.abs(durationSec - D);
         score += diff <= 3 ? 0 : diff <= 6 ? 1 : diff <= 10 ? 3 : diff <= 20 ? 8 : 20 + Math.floor((diff - 20) / 5);
@@ -71,11 +73,9 @@ function scoreResult({ title, channel, durationSec }, want) {
         score += 5;
     }
 
-    // phạt tiêu đề kém
     if (titleLooksBad(title)) score += 8;
     score += channelPriority(channel);
 
-    // phủ token
     const t = normalizeText(title);
     const wantTokens = (normalizeText(want.track) + ' ' + normalizeText(want.artist))
         .split(' ')
@@ -128,11 +128,15 @@ function getYTParams(raw) {
         return { v: null, list: null, index: undefined, cleanVideoUrl: (id) => `https://www.youtube.com/watch?v=${id}` };
     }
 }
+function tryExtractRDSeed(list) {
+    const m = /^RD([A-Za-z0-9_-]{11})$/i.exec(String(list || ''));
+    return m ? m[1] : null;
+}
 async function resolveYouTubePlayableUrl(rawUrl) {
     const { v, list, index, cleanVideoUrl } = getYTParams(rawUrl);
     if (v) return cleanVideoUrl(v);
 
-    // playlist thường (PL/LL/WL...), lấy 1 video cụ thể
+    // playlist thường (PL/LL/WL...)
     if (list && !/^RD/i.test(list)) {
         const pl = await play.playlist_info(normalizeYouTubeUrl(rawUrl), { incomplete: true });
         const vids = await pl.all_videos();
@@ -142,13 +146,47 @@ async function resolveYouTubePlayableUrl(rawUrl) {
         return chosen.url;
     }
 
-    // radio playlist (list=RD...) yêu cầu có v
+    // RD: phát seed nếu suy ra được
     if (list && /^RD/i.test(list)) {
-        if (v) return cleanVideoUrl(v);
+        const seed = v || tryExtractRDSeed(list);
+        if (seed) return `https://www.youtube.com/watch?v=${seed}`;
         throw new Error('Radio playlist (RD) không có video cụ thể.');
     }
 
     return normalizeYouTubeUrl(rawUrl);
+}
+
+// ================= RD expansion via yt-dlp =================
+async function expandRDWithYtDlp(url) {
+    // ghi cookie ENV (nếu có) ra file tạm để yt-dlp dùng
+    let cookiePath = null;
+    if (process.env.YT_COOKIE) {
+        cookiePath = '/tmp/youtube.cookies.txt';
+        writeFileSync(cookiePath, process.env.YT_COOKIE, 'utf8');
+    }
+    return await new Promise((resolve, reject) => {
+        const args = ['-J', '--flat-playlist', url];
+        if (cookiePath) args.push('--cookies', cookiePath);
+        execFile(
+            YTDLP_BIN,
+            args,
+            { maxBuffer: 1024 * 1024 * 32 },
+            (err, stdout, stderr) => {
+                if (err) return reject(stderr || err);
+                try {
+                    const data = JSON.parse(stdout);
+                    const entries = data?.entries || [];
+                    const urls = entries
+                        .map(e => e?.url || e?.id)
+                        .filter(Boolean)
+                        .map(x => (String(x).startsWith('http') ? x : `https://www.youtube.com/watch?v=${x}`));
+                    resolve(urls);
+                } catch (e) {
+                    reject(e);
+                }
+            }
+        );
+    });
 }
 
 // ================= Helpers: Spotify (Web API) =================
@@ -158,7 +196,7 @@ const spotify = new SpotifyWebApi({
 });
 let spotifyTokenExpiry = 0;
 async function ensureSpotifyToken() {
-    if (!spotify.getClientId() || !spotify.getClientSecret()) return; // cho phép thiếu Spotify
+    if (!spotify.getClientId() || !spotify.getClientSecret()) return;
     const now = Date.now();
     if (now < spotifyTokenExpiry - 10_000) return;
     const data = await spotify.clientCredentialsGrant();
@@ -232,9 +270,7 @@ async function fetchTitle(url) {
     try {
         if (ytdl.validateURL(url)) {
             const info = await ytdl.getBasicInfo(url, {
-                requestOptions: {
-                    headers: { 'user-agent': 'Mozilla/5.0' },
-                },
+                requestOptions: { headers: { 'user-agent': 'Mozilla/5.0' } },
             });
             return info?.videoDetails?.title || url;
         }
@@ -285,9 +321,7 @@ async function createResourceFromUrl(urlInput) {
         try {
             finalUrl = await resolveYouTubePlayableUrl(finalUrl);
         } catch (e) {
-            const msg = String(e?.message || e || '');
-            // nếu radio playlist không có v -> không thể chọn video cụ thể: để fallback mirror-search/throw
-            console.warn('[resolveYouTubePlayableUrl] note:', msg);
+            console.warn('[resolveYouTubePlayableUrl] note:', String(e?.message || e || ''));
         }
 
         // Try 1: play-dl
@@ -307,11 +341,7 @@ async function createResourceFromUrl(urlInput) {
                 filter: 'audioonly',
                 quality: 'highestaudio',
                 highWaterMark: 1 << 25,
-                requestOptions: {
-                    headers: {
-                        'user-agent': 'Mozilla/5.0',
-                    },
-                },
+                requestOptions: { headers: { 'user-agent': 'Mozilla/5.0' } },
             });
             return {
                 resource: createAudioResource(ytStream, { inputType: StreamType.Arbitrary, inlineVolume: true }),
@@ -342,7 +372,7 @@ async function createResourceFromUrl(urlInput) {
         throw new Error('Không stream được từ YouTube (đã thử nhiều cách).');
     }
 
-    // Spotify → đổi sang YouTube (playlist/album: lấy bài đầu để phát ngay)
+    // Spotify → đổi sang YouTube (playlist/album: lấy bài đầu)
     if (/^(https?:\/\/)?open\.spotify\.com\//i.test(urlInput)) {
         const ytUrls = await resolveSpotifyToYoutubeUrls(urlInput);
         finalUrl = ytUrls[0];
@@ -372,10 +402,17 @@ async function expandToUrls(rawUrl) {
         const { v, list } = getYTParams(rawUrl);
         if (v && !list) return [await resolveYouTubePlayableUrl(rawUrl)];
         if (list) {
+            // RD (Mix/Radio): dùng yt-dlp để expand đầy đủ
             if (/^RD/i.test(String(list))) {
-                // Radio playlist: chỉ phát bài có v, còn queue thì bỏ qua
-                return v ? [`https://www.youtube.com/watch?v=${v}`] : [];
+                try {
+                    const urls = await expandRDWithYtDlp(normalizeYouTubeUrl(rawUrl));
+                    return urls;
+                } catch {
+                    const seed = v || tryExtractRDSeed(list);
+                    return seed ? [`https://www.youtube.com/watch?v=${seed}`] : [];
+                }
             }
+            // playlist chuẩn
             const pl = await play.playlist_info(normalizeYouTubeUrl(rawUrl), { incomplete: true });
             const vids = await pl.all_videos();
             return vids.map(vv => vv.url);
