@@ -25,6 +25,22 @@ const commands = [
         .addIntegerOption(o =>
             o.setName('page').setDescription('Trang (mỗi trang 10 bài, mặc định 1)').setMinValue(1)
         ),
+
+    // ✅ Thêm mới: /loop
+    new SlashCommandBuilder()
+        .setName('loop')
+        .setDescription('Bật/tắt loop')
+        .addStringOption(o =>
+            o
+                .setName('mode')
+                .setDescription('none | one | all')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'none', value: 'none' },
+                    { name: 'one', value: 'one' },
+                    { name: 'all', value: 'all' },
+                )
+        ),
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);

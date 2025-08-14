@@ -453,17 +453,26 @@ function getOrCreate(guild, voiceChannel) {
 
         connection.subscribe(player);
 
-        ctx = { player, connection, queue: [], now: null, textChannelId: undefined };
+        ctx = { player, connection, queue: [], now: null, textChannelId: undefined, loopMode: 'none' };
         contexts.set(guild.id, ctx);
 
         // Hết bài → phát tiếp từ queue
         player.on(AudioPlayerStatus.Idle, async () => {
             try {
-                if (ctx.queue.length > 0) {
+                if (ctx.loopMode === 'one' && ctx.now) {
+                    await playOne(ctx, ctx.now.url, { announce: true });
+                } else if (ctx.queue.length > 0) {
                     const next = ctx.queue.shift();
-                    await playOne(ctx, next.url, { announce: true }); // gửi announce im lặng
+                    await playOne(ctx, next.url, { announce: true });
+                    if (ctx.loopMode === 'all' && ctx.now) {
+                        ctx.queue.push({ url: ctx.now.url, title: ctx.now.title });
+                    }
                 } else {
-                    ctx.now = null;
+                    if (ctx.loopMode === 'all' && ctx.now) {
+                        await playOne(ctx, ctx.now.url, { announce: true });
+                    } else {
+                        ctx.now = null;
+                    }
                 }
             } catch (e) {
                 console.error('[AUTO-NEXT] error:', e);
@@ -656,6 +665,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const ok = ctx.player.unpause();
         return interaction.reply(ok ? '▶️ Tiếp tục phát.' : '⚠️ Không tiếp tục được.');
     }
+
+    // /loop
+    if (interaction.commandName === 'loop') {
+        const mode = interaction.options.getString('mode', true); // 'none', 'one', 'all'
+        let ctx = contexts.get(guild.id);
+        if (!ctx) return interaction.reply({ content: '❗ Không có nhạc để loop.', ephemeral: true });
+
+        if (!['none', 'one', 'all'].includes(mode)) {
+            return interaction.reply({ content: '⚠️ Mode không hợp lệ. Dùng: none, one, all.', ephemeral: true });
+        }
+
+        ctx.loopMode = mode;
+        return interaction.reply(`🔁 Chế độ loop: **${mode}**`);
+    }
+
 
     // /nowplaying
     if (interaction.commandName === 'nowplaying') {
