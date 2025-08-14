@@ -26,7 +26,7 @@ const commands = [
             o.setName('page').setDescription('Trang (mỗi trang 10 bài, mặc định 1)').setMinValue(1)
         ),
 
-    // ✅ Thêm mới: /loop..
+    // ✅ Thêm mới: /loop.
     new SlashCommandBuilder()
         .setName('loop')
         .setDescription('Bật/tắt loop')

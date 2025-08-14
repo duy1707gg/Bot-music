@@ -666,14 +666,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.reply(ok ? '▶️ Tiếp tục phát.' : '⚠️ Không tiếp tục được.');
     }
 
-    // /loop..
+    // /loop.
     if (interaction.commandName === 'loop') {
         const mode = interaction.options.getString('mode', true); // 'none', 'one', 'all'
         let ctx = contexts.get(guild.id);
         if (!ctx) return interaction.reply({ content: '❗ Không có nhạc để loop.', ephemeral: true });
 
         if (!['none', 'one', 'all'].includes(mode)) {
-            return interaction.reply({ content: '⚠️ Mode không hợp lệ. Dùng: none, one, all.', ephemeral: true });
+            return interaction.reply({ content: '⚠️ Mode không hợp lệ! Dùng: none, one, all.', ephemeral: true });
         }
 
         ctx.loopMode = mode;
