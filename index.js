@@ -666,7 +666,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.reply(ok ? '▶️ Tiếp tục phát.' : '⚠️ Không tiếp tục được.');
     }
 
-    // /loop
+    // /loop..
     if (interaction.commandName === 'loop') {
         const mode = interaction.options.getString('mode', true); // 'none', 'one', 'all'
         let ctx = contexts.get(guild.id);
