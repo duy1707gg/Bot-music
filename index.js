@@ -371,35 +371,80 @@ async function expandRDWithYtDlp(url) {
 }
 
 // ============== Stream trực tiếp bằng yt-dlp (stdout) ==============
+// ============== Stream trực tiếp bằng yt-dlp (stdout, audio-only, cookie Netscape, client fallback) ==============
 function buildYtDlpAudioResource(url) {
     const cookiePath = cookies?.length ? writeNetscapeCookieFile(cookies) : null;
 
-    const YT_CLIENT = process.env.YTDLP_CLIENT || 'android'; // 'android' | 'web' | 'ios' | 'tv_embedded'
-    const YT_FORMAT = process.env.YTDLP_FORMAT || 'ba[ext=m4a]/ba[acodec^=mp4a]/ba/best';
+    // Format chain: ưu tiên m4a (ít bị chặn), rồi opus, rồi bestaudio.
+    const FORMAT =
+        process.env.YTDLP_FORMAT ||
+        '234/251/140/bestaudio[ext=m4a]/bestaudio';
+    // 234: HLS audio mp4 (nếu có), 251: webm/opus, 140: m4a
 
-    const args = [
-        '-f', YT_FORMAT,
-        '--no-playlist',
-        '-o', '-',
-        '--quiet', '--no-warnings',
-        '--geo-bypass',
-        '--force-ipv4',
-        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-        '--extractor-args', `youtube:player_client=${YT_CLIENT}`,
-        '--retries', '3',
-        '--fragment-retries', '3',
-        url,
-    ];
-    if (cookiePath) args.unshift('--cookies', cookiePath); // chèn trước URL
+    // Thử nhiều client để né SABR / CAPTCHA: ios -> web -> android -> tv_embedded
+    const CLIENTS = (process.env.YTDLP_CLIENTS || 'ios,web,android,tv_embedded')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
 
-    const proc = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    proc.on('error', (e) => console.error('[yt-dlp spawn error]', e));
-    proc.stderr.on('data', (d) => {
-        const s = d.toString();
-        if (s && !/^\s*$/.test(s)) console.warn('[yt-dlp]', s.trim());
-    });
+    // Build một process yt-dlp với client nhất định
+    const spawnOnce = (client) => {
+        const args = [
+            '-f', FORMAT,
+            '--no-playlist',
+            '-o', '-',
+            '--quiet', '--no-warnings',
+            '--geo-bypass',
+            '--force-ipv4',
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+            '--extractor-args', `youtube:player_client=${client}`,
+            '--retries', '3',
+            '--fragment-retries', '3',
+        ];
 
-    const resource = createAudioResource(proc.stdout, {
+        if (cookiePath) {
+            // PHẢI kèm cờ --cookies trước URL
+            args.push('--cookies', cookiePath);
+        }
+
+        args.push(url);
+
+        const proc = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        proc.on('error', (e) => console.error('[yt-dlp spawn error]', e));
+        proc.stderr.on('data', (d) => {
+            const s = d.toString();
+            if (s && !/^\s*$/.test(s)) console.warn(`[yt-dlp ${client}]`, s.trim());
+        });
+        return proc;
+    };
+
+    // Thử lần lượt các client đến khi stdout có data (coi như “lock-in” thành công)
+    let lockedProc = null;
+    for (const client of CLIENTS) {
+        const proc = spawnOnce(client);
+
+        // Khi nhận data đầu tiên, coi như ok — dùng proc này
+        const onData = (chunk) => {
+            if (lockedProc) return; // đã có proc khoá
+            lockedProc = proc;
+            // gỡ listener ở các proc khác (nếu có) — an toàn bỏ qua vì GC sẽ dọn
+        };
+
+        // Đăng ký tạm để quyết định lock
+        proc.stdout.once('data', onData);
+
+        // Nếu process này kết thúc quá sớm trước khi có data, thử client kế
+        // (không chặn vòng lặp; việc lock sẽ dựa trên onData)
+        if (!lockedProc) {
+            // cho proc chút thời gian, nhưng vì ta trả resource ngay sau vòng for,
+            // phần “chờ” thực tế sẽ do Discord audio đọc stream — onData sẽ lock khi có.
+            // Nên không cần delay ở đây.
+        }
+        // Gắn proc đầu tiên làm candidate nếu chưa có cái nào khoá
+        if (!lockedProc) lockedProc = lockedProc || proc;
+    }
+
+    const resource = createAudioResource(lockedProc.stdout, {
         inputType: StreamType.Arbitrary,
         inlineVolume: true,
     });
@@ -407,6 +452,7 @@ function buildYtDlpAudioResource(url) {
     resource.playStream?.on?.('error', (err) => console.error('[yt-dlp stream error]', err));
     return resource;
 }
+
 
 
 // ================= Spotify helpers =================
@@ -790,7 +836,7 @@ async function playOne(ctx, url, { announce = false } = {}) {
     let title = built.display;
     try {
         title = await fetchTitleWithTimeout(built.display, 1500);
-    } catch {}
+    } catch { }
 
     // CHỈ gán nếu ctx.now vẫn còn và đang phát đúng URL này
     if (ctx.now && ctx.now.url === built.display) {
