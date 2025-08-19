@@ -21,7 +21,7 @@ import {
     MessageFlags,
 } from 'discord.js';
 
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import play from 'play-dl';
 import SpotifyWebApi from 'spotify-web-api-node';
@@ -264,9 +264,14 @@ async function buildRadioFromSeed(seedUrl, maxCount = 25) {
 
 async function resolveYouTubePlayableUrl(rawUrl) {
     const norm = normalizeYouTubeUrl(rawUrl);
-    // Chuẩn hoá youtu.be/<id> -> watch?v=<id>
+    // Chuẩn hoá youtu.be, shorts, music.youtube
     try {
         const u = new URL(norm);
+        if (u.hostname === 'music.youtube.com') u.hostname = 'www.youtube.com';
+        if (u.pathname.startsWith('/shorts/')) {
+            const id = u.pathname.split('/')[2];
+            if (id) return `https://www.youtube.com/watch?v=${id}`;
+        }
         if (u.hostname === 'youtu.be') {
             const id = (u.pathname || '/').replace('/', '').trim();
             if (id) return `https://www.youtube.com/watch?v=${id}`;
@@ -277,7 +282,7 @@ async function resolveYouTubePlayableUrl(rawUrl) {
 
     // playlist thường (PL/LL/WL...)
     if (list && !/^RD/i.test(list)) {
-        const pl = await play.playlist_info(norm, { incomplete: true });
+        const pl = await play.playlist_info(`https://www.youtube.com/playlist?list=${list}`, { incomplete: true });
         const vids = await pl.all_videos();
         const i = index && index > 0 ? index - 1 : 0;
         const chosen = vids[i] || vids[0];
@@ -295,7 +300,7 @@ async function resolveYouTubePlayableUrl(rawUrl) {
     return norm;
 }
 
-// ================= RD expansion via yt-dlp =================
+// ================= RD/Playlist expansion via yt-dlp =================
 async function expandRDWithYtDlp(url) {
     let cookiePath = null;
     if (process.env.YT_COOKIE || process.env.YT_COOKIE_B64) {
@@ -327,6 +332,51 @@ async function expandRDWithYtDlp(url) {
             }
         );
     });
+}
+
+// ============== Stream trực tiếp bằng yt-dlp (stdout) ==============
+function ensureCookieHeaderFile() {
+    if (!(process.env.YT_COOKIE || process.env.YT_COOKIE_B64)) return null;
+    try {
+        const header = (cookies || []).map(c => `${c.name}=${c.value}`).join('; ');
+        const cookiePath = '/tmp/youtube.cookies.txt';
+        writeFileSync(cookiePath, header, 'utf8');
+        return cookiePath;
+    } catch (_) {
+        return null;
+    }
+}
+
+/**
+ * Tạo AudioResource bằng cách pipe bestaudio từ yt-dlp -> stdout.
+ * Ưu tiên m4a (ít bị chặn, nhẹ CPU vì không transcode).
+ */
+function buildYtDlpAudioResource(url) {
+    const args = [
+        '-f', 'bestaudio[ext=m4a]/bestaudio',
+        '--no-playlist',
+        '-o', '-',            // xuất ra stdout
+        '--quiet', '--no-warnings',
+        '--geo-bypass'
+    ];
+    const cookiePath = ensureCookieHeaderFile();
+    if (cookiePath) args.push('--cookies', cookiePath);
+    args.push(url);
+
+    const proc = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    proc.on('error', (e) => console.error('[yt-dlp spawn error]', e));
+    proc.stderr.on('data', d => {
+        const s = d.toString();
+        if (s && !/^\s*$/.test(s)) console.warn('[yt-dlp]', s.trim());
+    });
+
+    const resource = createAudioResource(proc.stdout, {
+        inputType: StreamType.Arbitrary,
+        inlineVolume: true,
+    });
+
+    resource.playStream?.on?.('error', err => console.error('[yt-dlp stream error]', err));
+    return resource;
 }
 
 // ================= Spotify helpers =================
@@ -434,7 +484,8 @@ function formatQueuePage(ctx, page = 1, perPage = 10) {
 
     const lines = ctx.queue.slice(startIndex, startIndex + perPage).map((item, i) => {
         const idx = startIndex + i + 1;
-        const title = item.title || item.url;
+        const safe = item || {};
+        const title = safe.title || safe.url || '(unknown)';
         return `**${idx}.** ${title}`;
     });
 
@@ -491,7 +542,15 @@ async function createResourceFromUrl(urlInput) {
             console.warn('[mirror-search] failed:', e?.message || e);
         }
 
-        // Try 3: ytdl-core (agent cookie, không header) — dùng cuối
+        // Try 3: yt-dlp (pipe stdout) — CHẮC KÈO NHẤT khi ytdl-core hỏng decipher/403
+        try {
+            const res = buildYtDlpAudioResource(finalUrl);
+            return { resource: res, display: finalUrl };
+        } catch (e) {
+            console.warn('[yt-dlp stdout fallback] failed:', e?.message || e);
+        }
+
+        // (Tuỳ chọn) cuối cùng mới dùng ytdl-core nếu bạn muốn thử vận may
         if (USE_YTDL_FALLBACK) {
             try {
                 const ytStream = ytdl(finalUrl, {
@@ -547,7 +606,7 @@ async function expandToUrls(rawUrl) {
                     const urls = (await expandRDWithYtDlp(normalizeYouTubeUrl(rawUrl)))
                         .filter(u => typeof u === 'string' && u.startsWith('http'));
                     // Nếu yt-dlp trả quá ít, tự build radio ~25 bài
-                    if (urls.length >= 2) return urls;
+                    if (urls.length >= 2) return Array.from(new Set(urls));
                     const seed = v || tryExtractRDSeed(list);
                     if (seed) {
                         const seedUrl = `https://www.youtube.com/watch?v=${seed}`;
@@ -569,7 +628,6 @@ async function expandToUrls(rawUrl) {
                 const pl = await play.playlist_info(canonical, { incomplete: true });
                 const vids = await pl.all_videos();
                 const urls1 = vids.map(vv => vv?.url).filter(u => typeof u === 'string' && u.startsWith('http'));
-                // Dedupe lần nữa phòng play-dl trả trùng
                 return Array.from(new Set(urls1));
             } catch (e) {
                 console.warn('[play-dl playlist] failed -> fallback yt-dlp:', e?.message || e);
@@ -577,7 +635,6 @@ async function expandToUrls(rawUrl) {
                 const urls2 = (await expandRDWithYtDlp(canonical))
                     .filter(u => typeof u === 'string' && u.startsWith('http'));
                 if (urls2.length) return Array.from(new Set(urls2));
-                // Nếu vẫn không có gì, trả về rỗng để /queue báo lỗi gọn
                 return [];
             }
         }
@@ -791,7 +848,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
             ctx.queue.push(...items);
 
             if (!ctx.now && ctx.queue.length > 0 && ctx.player.state.status !== AudioPlayerStatus.Playing) {
-                const first = ctx.queue.shift();
+                let first = null;
+                while (ctx.queue.length > 0 && !first) {
+                    const x = ctx.queue.shift();
+                    if (x && x.url) first = x;
+                }
+                if (!first) return interaction.editReply('❗ Không có bài hợp lệ để phát.');
                 await playOne(ctx, first.url, { announce: true });
                 return interaction.editReply(`➕ Thêm **${urls.length}** mục. 🎵 Đang phát: ${ctx.now?.title || ctx.now?.url}`);
             }
