@@ -60,7 +60,36 @@ function sanitizeCookies(arr) {
         .filter((c) => c.name && nameOk.test(c.name) && !/[;\r\n]/.test(c.value));
 }
 
+// Giữ đường dẫn file Netscape nếu có sẵn từ ENV
+let NETSCAPE_COOKIE_FILE = null;
+
 function getCookiesFromEnv() {
+    // 1) Netscape (base64) – ưu tiên cao nhất
+    if (process.env.YT_COOKIE_NS_B64) {
+        try {
+            const raw = Buffer.from(process.env.YT_COOKIE_NS_B64, 'base64').toString('utf8');
+            NETSCAPE_COOKIE_FILE = '/tmp/youtube.netscape.cookies.txt';
+            writeFileSync(NETSCAPE_COOKIE_FILE, raw, 'utf8');
+            console.log(`[YT] Netscape cookie (from YT_COOKIE_NS_B64) written: ${NETSCAPE_COOKIE_FILE}`);
+            return null; // báo hiệu dùng file netscape, không trả mảng JSON
+        } catch (e) {
+            console.warn('[YT] YT_COOKIE_NS_B64 decode fail:', e?.message || e);
+        }
+    }
+
+    // 2) Netscape (raw string)
+    if (process.env.YT_COOKIE_NS) {
+        try {
+            NETSCAPE_COOKIE_FILE = '/tmp/youtube.netscape.cookies.txt';
+            writeFileSync(NETSCAPE_COOKIE_FILE, process.env.YT_COOKIE_NS, 'utf8');
+            console.log(`[YT] Netscape cookie (from YT_COOKIE_NS) written: ${NETSCAPE_COOKIE_FILE}`);
+            return null;
+        } catch (e) {
+            console.warn('[YT] YT_COOKIE_NS write fail:', e?.message || e);
+        }
+    }
+
+    // 3) JSON (base64)
     if (process.env.YT_COOKIE_B64) {
         try {
             const json = Buffer.from(process.env.YT_COOKIE_B64, 'base64').toString('utf8');
@@ -70,6 +99,8 @@ function getCookiesFromEnv() {
             console.warn('[YT] YT_COOKIE_B64 không hợp lệ:', e?.message || e);
         }
     }
+
+    // 4) YT_COOKIE (JSON hoặc header "A=B; C=D")
     if (process.env.YT_COOKIE) {
         const raw = process.env.YT_COOKIE.trim();
         if (raw.startsWith('[')) {
@@ -81,23 +112,17 @@ function getCookiesFromEnv() {
         }
         return sanitizeCookies(parseHeaderToArray(raw));
     }
+
     return null;
 }
 
 const cookies = getCookiesFromEnv();
 
-// --- Ghi file Netscape cho yt-dlp ---
-function toNetscapeLine({ domain, includeSub = true, path = '/', secure = true, expiry, name, value }) {
-    // Netscape: domain \t includeSub \t path \t secure \t expiry(epoch) \t name \t value
-    const dom = domain?.startsWith('.') ? domain : `.${domain || 'youtube.com'}`;
-    const inc = includeSub ? 'TRUE' : 'FALSE';
-    const sec = secure ? 'TRUE' : 'FALSE';
-    const exp = Number.isFinite(expiry) ? Math.trunc(expiry) : Math.trunc(Date.now() / 1000) + 3600 * 24 * 30;
-    return `${dom}\t${inc}\t${path}\t${sec}\t${exp}\t${name}\t${value}`;
-}
-
+// --- Ghi file Netscape từ mảng JSON nếu chưa có file sẵn ---
 function writeNetscapeCookieFile(cookiesArr) {
+    if (NETSCAPE_COOKIE_FILE) return NETSCAPE_COOKIE_FILE; // đã có file từ ENV
     if (!cookiesArr || !cookiesArr.length) return null;
+
     const lines = [
         '# Netscape HTTP Cookie File',
         '# Generated at runtime for yt-dlp',
@@ -107,18 +132,10 @@ function writeNetscapeCookieFile(cookiesArr) {
         const expiry =
             c.expires != null
                 ? Math.trunc(new Date(c.expires).getTime() / 1000)
-                : undefined;
-        lines.push(
-            toNetscapeLine({
-                domain: c.domain || '.youtube.com',
-                includeSub: true,
-                path: c.path || '/',
-                secure: c.secure !== false,
-                expiry,
-                name: c.name || c.key,
-                value: String(c.value).replace(/\r|\n/g, ''),
-            }),
-        );
+                : Math.trunc(Date.now() / 1000) + 3600 * 24 * 30;
+        const dom = (c.domain || '.youtube.com');
+        const line = `${dom.startsWith('.') ? dom : '.' + dom}\tTRUE\t${c.path || '/'}\t${c.secure !== false ? 'TRUE' : 'FALSE'}\t${expiry}\t${c.name}\t${String(c.value).replace(/\r|\n/g, '')}`;
+        lines.push(line);
     }
     const p = '/tmp/youtube.netscape.cookies.txt';
     writeFileSync(p, lines.join('\n') + '\n', 'utf8');
@@ -126,7 +143,7 @@ function writeNetscapeCookieFile(cookiesArr) {
     return p;
 }
 
-// play-dl token (header string)
+// play-dl token (header string) — chỉ set khi có mảng cookies JSON/header
 if (cookies && cookies.length) {
     const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
     try {
@@ -137,7 +154,7 @@ if (cookies && cookies.length) {
     }
 }
 
-// ytdl-core agent (định dạng mới)
+// ytdl-core agent (định dạng mới) — chỉ tạo khi có mảng cookies JSON/header
 let ytdlAgent = undefined;
 if (cookies && cookies.length) {
     try {
@@ -339,16 +356,20 @@ async function resolveYouTubePlayableUrl(rawUrl) {
 
 // ================= RD/Playlist expansion via yt-dlp =================
 async function expandRDWithYtDlp(url) {
-    const cookiePath = cookies?.length ? writeNetscapeCookieFile(cookies) : null;
+    const cookiePath = writeNetscapeCookieFile(cookies);
     return await new Promise((resolve, reject) => {
         const args = [
-            '-J', '--flat-playlist',
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+            '-J',
+            '--flat-playlist',
+            '--user-agent',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+            '--extractor-args',
+            'youtube:player_client=web',
             '--force-ipv4',
-            url,
         ];
+        if (cookiePath) args.push('--cookies', cookiePath);
+        args.push(url);
 
-        if (cookiePath) args.unshift('--cookies', cookiePath);
         execFile(
             YTDLP_BIN,
             args,
@@ -371,24 +392,20 @@ async function expandRDWithYtDlp(url) {
 }
 
 // ============== Stream trực tiếp bằng yt-dlp (stdout) ==============
-// ============== Stream trực tiếp bằng yt-dlp (stdout, audio-only, cookie Netscape, client fallback) ==============
-function buildYtDlpAudioResource(url) {
-    const cookiePath = cookies?.length ? writeNetscapeCookieFile(cookies) : null;
+async function buildYtDlpAudioResource(url) {
+    const cookiePath = writeNetscapeCookieFile(cookies);
 
-    // Format chain: ưu tiên m4a (ít bị chặn), rồi opus, rồi bestaudio.
     const FORMAT =
         process.env.YTDLP_FORMAT ||
-        '234/251/140/bestaudio[ext=m4a]/bestaudio';
-    // 234: HLS audio mp4 (nếu có), 251: webm/opus, 140: m4a
+        '233/234/251/140/bestaudio[ext=m4a]/bestaudio';
 
-    // Thử nhiều client để né SABR / CAPTCHA: ios -> web -> android -> tv_embedded
     const CLIENTS = (process.env.YTDLP_CLIENTS || 'ios,web,android,tv_embedded')
         .split(',')
-        .map(s => s.trim())
+        .map((s) => s.trim())
         .filter(Boolean);
 
-    // Build một process yt-dlp với client nhất định
-    const spawnOnce = (client) => {
+    // Thử tuần tự từng client: nếu proc bắt đầu đẩy dữ liệu thì dùng client đó
+    for (const client of CLIENTS) {
         const args = [
             '-f', FORMAT,
             '--no-playlist',
@@ -401,59 +418,52 @@ function buildYtDlpAudioResource(url) {
             '--retries', '3',
             '--fragment-retries', '3',
         ];
-
-        if (cookiePath) {
-            // PHẢI kèm cờ --cookies trước URL
-            args.push('--cookies', cookiePath);
-        }
-
+        if (cookiePath) args.push('--cookies', cookiePath);
         args.push(url);
 
         const proc = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-        proc.on('error', (e) => console.error('[yt-dlp spawn error]', e));
-        proc.stderr.on('data', (d) => {
-            const s = d.toString();
-            if (s && !/^\s*$/.test(s)) console.warn(`[yt-dlp ${client}]`, s.trim());
+
+        // Chờ tín hiệu "có data" hoặc process die sớm
+        const ok = await new Promise((resolve) => {
+            let decided = false;
+            const t = setTimeout(() => {
+                if (!decided) { decided = true; resolve(false); }
+            }, 2500);
+
+            proc.stderr.on('data', (d) => {
+                const s = d.toString();
+                if (s && !/^\s*$/.test(s)) console.warn(`[yt-dlp ${client}]`, s.trim());
+            });
+
+            proc.stdout.once('data', () => {
+                if (!decided) {
+                    clearTimeout(t);
+                    decided = true;
+                    resolve(true);
+                }
+            });
+            proc.on('exit', () => {
+                if (!decided) { clearTimeout(t); decided = true; resolve(false); }
+            });
+            proc.on('error', () => {
+                if (!decided) { clearTimeout(t); decided = true; resolve(false); }
+            });
         });
-        return proc;
-    };
 
-    // Thử lần lượt các client đến khi stdout có data (coi như “lock-in” thành công)
-    let lockedProc = null;
-    for (const client of CLIENTS) {
-        const proc = spawnOnce(client);
-
-        // Khi nhận data đầu tiên, coi như ok — dùng proc này
-        const onData = (chunk) => {
-            if (lockedProc) return; // đã có proc khoá
-            lockedProc = proc;
-            // gỡ listener ở các proc khác (nếu có) — an toàn bỏ qua vì GC sẽ dọn
-        };
-
-        // Đăng ký tạm để quyết định lock
-        proc.stdout.once('data', onData);
-
-        // Nếu process này kết thúc quá sớm trước khi có data, thử client kế
-        // (không chặn vòng lặp; việc lock sẽ dựa trên onData)
-        if (!lockedProc) {
-            // cho proc chút thời gian, nhưng vì ta trả resource ngay sau vòng for,
-            // phần “chờ” thực tế sẽ do Discord audio đọc stream — onData sẽ lock khi có.
-            // Nên không cần delay ở đây.
+        if (ok) {
+            const resource = createAudioResource(proc.stdout, {
+                inputType: StreamType.Arbitrary,
+                inlineVolume: true,
+            });
+            resource.playStream?.on?.('error', (err) => console.error('[yt-dlp stream error]', err));
+            return resource;
+        } else {
+            try { proc.kill('SIGKILL'); } catch { }
         }
-        // Gắn proc đầu tiên làm candidate nếu chưa có cái nào khoá
-        if (!lockedProc) lockedProc = lockedProc || proc;
     }
 
-    const resource = createAudioResource(lockedProc.stdout, {
-        inputType: StreamType.Arbitrary,
-        inlineVolume: true,
-    });
-
-    resource.playStream?.on?.('error', (err) => console.error('[yt-dlp stream error]', err));
-    return resource;
+    throw new Error('yt-dlp không thể mở stream audio (mọi client đều thất bại).');
 }
-
-
 
 // ================= Spotify helpers =================
 const spotify = new SpotifyWebApi({
@@ -592,15 +602,15 @@ async function createResourceFromUrl(urlInput) {
             console.warn('[resolveYouTubePlayableUrl] note:', String(e?.message || e || ''));
         }
 
-        // Try 1: yt-dlp (web client + cookies)
+        // Try 1: yt-dlp (ưu tiên)
         try {
-            const res = buildYtDlpAudioResource(finalUrl);
+            const res = await buildYtDlpAudioResource(finalUrl);
             return { resource: res, display: finalUrl };
         } catch (e) {
             console.warn('[yt-dlp stdout] failed:', e?.message || e);
         }
 
-        // Try 2: play-dl (thường fail CAPTCHA, nhưng cứ thử)
+        // Try 2: play-dl
         try {
             const info = await play.stream(finalUrl, { quality: 2 });
             return {
@@ -629,7 +639,7 @@ async function createResourceFromUrl(urlInput) {
             console.warn('[mirror-search] failed:', e?.message || e);
         }
 
-        // Try 4: ytdl-core (cuối cùng mới thử)
+        // Try 4: ytdl-core (cuối)
         if (USE_YTDL_FALLBACK) {
             try {
                 const ytStream = ytdl(finalUrl, {
@@ -816,7 +826,13 @@ async function announceNowPlaying(client, ctx) {
 }
 
 async function playOne(ctx, url, { announce = false } = {}) {
-    const built = await createResourceFromUrl(url);
+    let built;
+    try {
+        built = await createResourceFromUrl(url);
+    } catch (e) {
+        console.error('[playOne] build resource error:', e);
+        throw e;
+    }
 
     ctx.now = { url: built.display, title: undefined };
 
@@ -831,21 +847,16 @@ async function playOne(ctx, url, { announce = false } = {}) {
         throw e;
     }
 
-    built.resource.playStream?.on?.('error', (err) => console.error('[Stream error]', err));
+    built.resource?.playStream?.on?.('error', (err) => console.error('[Stream error]', err));
 
     let title = built.display;
     try {
         title = await fetchTitleWithTimeout(built.display, 1500);
     } catch { }
+    ctx.now.title = title || built.display;
 
-    // CHỈ gán nếu ctx.now vẫn còn và đang phát đúng URL này
-    if (ctx.now && ctx.now.url === built.display) {
-        ctx.now.title = title;
-    }
-
-    printNowPlaying(title);
+    printNowPlaying(ctx.now.title);
     if (announce) await announceNowPlaying(client, ctx);
-
 }
 
 // ================= Bot setup & commands =================
