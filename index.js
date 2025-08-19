@@ -60,53 +60,35 @@ function sanitizeCookies(arr) {
         .filter((c) => c.name && nameOk.test(c.name) && !/[;\r\n]/.test(c.value));
 }
 
+
 // Giữ đường dẫn file Netscape nếu có sẵn từ ENV
 let NETSCAPE_COOKIE_FILE = null;
 
 function getCookiesFromEnv() {
-    // 1) Netscape (base64) – ưu tiên cao nhất
-    if (process.env.YT_COOKIE_NS_B64) {
-        try {
-            const raw = Buffer.from(process.env.YT_COOKIE_NS_B64, 'base64').toString('utf8');
-            NETSCAPE_COOKIE_FILE = '/tmp/youtube.netscape.cookies.txt';
-            writeFileSync(NETSCAPE_COOKIE_FILE, raw, 'utf8');
-            console.log(`[YT] Netscape cookie (from YT_COOKIE_NS_B64) written: ${NETSCAPE_COOKIE_FILE}`);
-            return null; // báo hiệu dùng file netscape, không trả mảng JSON
-        } catch (e) {
-            console.warn('[YT] YT_COOKIE_NS_B64 decode fail:', e?.message || e);
-        }
-    }
-
-    // 2) Netscape (raw string)
-    if (process.env.YT_COOKIE_NS) {
-        try {
-            NETSCAPE_COOKIE_FILE = '/tmp/youtube.netscape.cookies.txt';
-            writeFileSync(NETSCAPE_COOKIE_FILE, process.env.YT_COOKIE_NS, 'utf8');
-            console.log(`[YT] Netscape cookie (from YT_COOKIE_NS) written: ${NETSCAPE_COOKIE_FILE}`);
-            return null;
-        } catch (e) {
-            console.warn('[YT] YT_COOKIE_NS write fail:', e?.message || e);
-        }
-    }
-
-    // 3) JSON (base64)
+    // 1) Ưu tiên: YT_COOKIE_B64 có thể là JSON *hoặc* Netscape (base64)
     if (process.env.YT_COOKIE_B64) {
         try {
-            const json = Buffer.from(process.env.YT_COOKIE_B64, 'base64').toString('utf8');
-            const arr = JSON.parse(json);
-            return sanitizeCookies(arr);
+            const decoded = Buffer.from(process.env.YT_COOKIE_B64, 'base64').toString('utf8').trim();
+            if (decoded.startsWith('# Netscape')) {
+                // Lưu raw netscape & cũng parse thành mảng để set header cho play-dl
+                globalThis.__YT_NETSCAPE_FILE = writeNetscapeRaw(decoded);
+                const arr = parseNetscapeToArray(decoded);
+                return sanitizeCookies(arr);
+            } else {
+                // JSON (mảng object cookie)
+                const arr = JSON.parse(decoded);
+                return sanitizeCookies(arr);
+            }
         } catch (e) {
             console.warn('[YT] YT_COOKIE_B64 không hợp lệ:', e?.message || e);
         }
     }
 
-    // 4) YT_COOKIE (JSON hoặc header "A=B; C=D")
+    // 2) Fallback: YT_COOKIE (JSON hoặc "A=B; C=D")
     if (process.env.YT_COOKIE) {
         const raw = process.env.YT_COOKIE.trim();
         if (raw.startsWith('[')) {
-            try {
-                return sanitizeCookies(JSON.parse(raw));
-            } catch (e) {
+            try { return sanitizeCookies(JSON.parse(raw)); } catch (e) {
                 console.warn('[YT] YT_COOKIE(JSON) không hợp lệ:', e?.message || e);
             }
         }
@@ -115,6 +97,18 @@ function getCookiesFromEnv() {
 
     return null;
 }
+
+function getCookieFilePath() {
+    // Nếu đã có file raw từ YT_COOKIE_B64 dạng Netscape thì dùng luôn
+    if (globalThis.__YT_NETSCAPE_FILE) return globalThis.__YT_NETSCAPE_FILE;
+
+    // Nếu chỉ có mảng cookies (JSON/chuỗi A=B;C=D), viết ra Netscape chuẩn
+    if (cookies?.length) {
+        return writeNetscapeCookieFile(cookies); // đã có sẵn ở code cũ
+    }
+    return null;
+}
+
 
 const cookies = getCookiesFromEnv();
 
@@ -142,6 +136,40 @@ function writeNetscapeCookieFile(cookiesArr) {
     console.log(`[YT] Netscape cookie file written: ${p} (${lines.length - 2} entries)`);
     return p;
 }
+
+// ---- Parse Netscape cookies -> array {name,value,domain,path,secure,expires}
+function parseNetscapeToArray(text) {
+    const out = [];
+    const lines = String(text).split(/\r?\n/);
+    for (const ln of lines) {
+        if (!ln || ln.startsWith('#')) continue;
+        // domain \t includeSub \t path \t secure \t expiry \t name \t value
+        const parts = ln.split('\t');
+        if (parts.length < 7) continue;
+        const [domain, , path, secureFlag, expiry, name, value] = parts;
+        if (!name) continue;
+        out.push({
+            name: name.trim(),
+            value: String(value || '').trim(),
+            domain: domain || '.youtube.com',
+            path: path || '/',
+            secure: /^true$/i.test(secureFlag || 'true'),
+            httpOnly: false,
+            expires: expiry ? Number(expiry) * 1000 : undefined,
+        });
+    }
+    return out;
+}
+
+// Ghi thẳng nội dung Netscape (string) ra file và trả về path
+function writeNetscapeRaw(text) {
+    const p = '/tmp/youtube.netscape.cookies.txt';
+    const body = String(text).replace(/\r\n/g, '\n');
+    writeFileSync(p, body.endsWith('\n') ? body : body + '\n', 'utf8');
+    console.log(`[YT] Netscape cookie file (raw) written: ${p}`);
+    return p;
+}
+
 
 // play-dl token (header string) — chỉ set khi có mảng cookies JSON/header
 if (cookies && cookies.length) {
@@ -356,7 +384,7 @@ async function resolveYouTubePlayableUrl(rawUrl) {
 
 // ================= RD/Playlist expansion via yt-dlp =================
 async function expandRDWithYtDlp(url) {
-    const cookiePath = writeNetscapeCookieFile(cookies);
+    const cookiePath = getCookieFilePath();
     return await new Promise((resolve, reject) => {
         const args = [
             '-J',
@@ -367,7 +395,7 @@ async function expandRDWithYtDlp(url) {
             'youtube:player_client=web',
             '--force-ipv4',
         ];
-        if (cookiePath) args.push('--cookies', cookiePath);
+        if (cookiePath) args.splice(1, 0, '--cookies', cookiePath);
         args.push(url);
 
         execFile(
@@ -393,7 +421,7 @@ async function expandRDWithYtDlp(url) {
 
 // ============== Stream trực tiếp bằng yt-dlp (stdout) ==============
 async function buildYtDlpAudioResource(url) {
-    const cookiePath = writeNetscapeCookieFile(cookies);
+    const cookiePath = getCookieFilePath();
 
     const FORMAT =
         process.env.YTDLP_FORMAT ||
@@ -418,7 +446,7 @@ async function buildYtDlpAudioResource(url) {
             '--retries', '3',
             '--fragment-retries', '3',
         ];
-        if (cookiePath) args.push('--cookies', cookiePath);
+        if (cookiePath) args.splice(1, 0, '--cookies', cookiePath);
         args.push(url);
 
         const proc = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
