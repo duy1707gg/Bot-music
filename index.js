@@ -1,4 +1,4 @@
-// index.js — Discord music bot (RD playlist support via yt-dlp, cookie optional)
+// index.js — Discord music bot (RD playlist support via yt-dlp; Railway-friendly cookies)
 
 import 'dotenv/config';
 
@@ -26,45 +26,82 @@ import { writeFileSync } from 'node:fs';
 import play from 'play-dl';
 import SpotifyWebApi from 'spotify-web-api-node';
 
-// ====== Cấu hình nhị phân yt-dlp ======
+// ================= Config =================
 const YTDLP_BIN = process.env.YTDLP_BIN || '/usr/local/bin/yt-dlp';
+const USE_YTDL_FALLBACK = true; // có thể set false để tạm thời chỉ dùng play-dl
 
-// ====== Cookie cho play-dl (tùy chọn) ======
-if (process.env.YT_COOKIE) {
-    try {
-        await play.setToken({ youtube: { cookie: process.env.YT_COOKIE } });
-        console.log('[YT] cookie loaded for play-dl');
-    } catch (e) {
-        console.warn('[YT] failed to set cookie for play-dl:', e?.message || e);
-    }
-}
-
-// ====== Cookie agent cho ytdl-core (định dạng mới) ======
-function parseCookieHeaderToArray(str) {
-    // Hỗ trợ chuỗi: "NAME=VAL; NAME2=VAL2; ..."
+// ================= Cookie helpers (Railway-safe) =================
+function parseHeaderToArray(str) {
+    // "A=B; C=D" -> [{name:'A', value:'B'}, ...]
     return String(str)
         .split(';')
         .map(s => s.trim())
         .filter(Boolean)
         .map(pair => {
-            const eq = pair.indexOf('=');
-            const name = eq === -1 ? pair : pair.slice(0, eq);
-            const value = eq === -1 ? '' : pair.slice(eq + 1);
+            const i = pair.indexOf('=');
+            const name = i === -1 ? pair : pair.slice(0, i);
+            const value = i === -1 ? '' : pair.slice(i + 1);
             return { name, value };
         });
 }
 
-let ytdlAgent = undefined;
-if (process.env.YT_COOKIE) {
-    try {
+function sanitizeCookies(arr) {
+    const nameOk = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/; // RFC token
+    return (arr || [])
+        .map(c => ({
+            name: String(c.name || c.key || '').trim(),
+            value: String(c.value || '').replace(/[\r\n]/g, ''), // loại bỏ xuống dòng
+            domain: c.domain || '.youtube.com',
+            path: c.path || '/',
+            secure: c.secure ?? true,
+            httpOnly: c.httpOnly ?? false,
+        }))
+        .filter(c => c.name && nameOk.test(c.name) && !/[;\r\n]/.test(c.value));
+}
+
+function getCookiesFromEnv() {
+    // Ưu tiên JSON Base64
+    if (process.env.YT_COOKIE_B64) {
+        try {
+            const json = Buffer.from(process.env.YT_COOKIE_B64, 'base64').toString('utf8');
+            const arr = JSON.parse(json);
+            return sanitizeCookies(arr);
+        } catch (e) {
+            console.warn('[YT] YT_COOKIE_B64 không hợp lệ:', e?.message || e);
+        }
+    }
+    // Fallback: YT_COOKIE (JSON hoặc "A=B; C=D")
+    if (process.env.YT_COOKIE) {
         const raw = process.env.YT_COOKIE.trim();
-        const cookies = raw.startsWith('[')
-            ? JSON.parse(raw)                // JSON export (khuyến nghị)
-            : parseCookieHeaderToArray(raw); // fallback chuỗi "a=b; c=d"
-        ytdlAgent = ytdl.createAgent(cookies);
-        console.log('[YT] ytdl agent đã khởi tạo với cookie');
+        if (raw.startsWith('[')) {
+            try { return sanitizeCookies(JSON.parse(raw)); } catch { }
+        }
+        return sanitizeCookies(parseHeaderToArray(raw));
+    }
+    return null;
+}
+
+const cookies = getCookiesFromEnv();
+
+// play-dl token (cần header string)
+if (cookies && cookies.length) {
+    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    try {
+        await play.setToken({ youtube: { cookie: cookieHeader } });
+        console.log('[YT] cookie loaded for play-dl');
     } catch (e) {
-        console.warn('[YT] lỗi tạo agent từ YT_COOKIE:', e?.message || e);
+        console.warn('[YT] play-dl setToken failed:', e?.message || e);
+    }
+}
+
+// ytdl-core agent (định dạng mới) — KHÔNG nhét cookie vào headers nữa
+let ytdlAgent = undefined;
+if (cookies && cookies.length) {
+    try {
+        ytdlAgent = ytdl.createAgent(cookies);
+        console.log('[YT] ytdl agent ready');
+    } catch (e) {
+        console.warn('[YT] ytdl.createAgent failed:', e?.message || e);
     }
 }
 
@@ -192,11 +229,12 @@ async function resolveYouTubePlayableUrl(rawUrl) {
 
 // ================= RD expansion via yt-dlp =================
 async function expandRDWithYtDlp(url) {
-    // ghi cookie ENV (nếu có) ra file tạm để yt-dlp dùng
     let cookiePath = null;
-    if (process.env.YT_COOKIE) {
+    if (process.env.YT_COOKIE || process.env.YT_COOKIE_B64) {
+        // ghi cookie ENV ra file để yt-dlp dùng
+        const header = cookies?.map(c => `${c.name}=${c.value}`).join('; ') || '';
         cookiePath = '/tmp/youtube.cookies.txt';
-        writeFileSync(cookiePath, process.env.YT_COOKIE, 'utf8');
+        writeFileSync(cookiePath, header, 'utf8');
     }
     return await new Promise((resolve, reject) => {
         const args = ['-J', '--flat-playlist', url];
@@ -223,7 +261,7 @@ async function expandRDWithYtDlp(url) {
     });
 }
 
-// ================= Helpers: Spotify (Web API) =================
+// ================= Spotify helpers =================
 const spotify = new SpotifyWebApi({
     clientId: process.env.SPOTIFY_CLIENT_ID || '',
     clientSecret: process.env.SPOTIFY_CLIENT_SECRET || '',
@@ -302,12 +340,10 @@ async function resolveSpotifyToYoutubeUrls(spotifyUrl) {
 // ================= Titles & formatting =================
 async function fetchTitle(url) {
     try {
-        // Ưu tiên play-dl (ít bị chặn)
         if (/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//i.test(url)) {
             const info = await play.video_basic_info(url).catch(() => null);
             if (info?.video_details?.title) return info.video_details.title;
         }
-        // Fallback ytdl-core (dùng agent cookie mới)
         if (ytdl.validateURL(url)) {
             const info = await ytdl.getBasicInfo(url, ytdlAgent ? { agent: ytdlAgent } : undefined);
             return info?.videoDetails?.title || url;
@@ -339,7 +375,7 @@ function formatQueuePage(ctx, page = 1, perPage = 10) {
 function shuffleInPlace(arr) {
     for (let i = arr.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
-        [arr[i], arr[j]] = [arr[j], arr[i]];
+        [arr[i], arr[j]] = [arr[j]];
     }
 }
 function printNowPlaying(titleOrUrl) {
@@ -366,26 +402,28 @@ async function createResourceFromUrl(urlInput) {
                 display: finalUrl,
             };
         } catch (e) {
-            console.warn('[play-dl] direct stream failed, fallback ytdl:', e?.message || e);
+            console.warn('[play-dl] direct stream failed', e?.message || e);
         }
 
-        // Try 2: ytdl-core (DÙNG AGENT COOKIE, KHÔNG NHÉT HEADER)
-        try {
-            const ytStream = ytdl(finalUrl, {
-                filter: 'audioonly',
-                quality: 'highestaudio',
-                highWaterMark: 1 << 25,
-                ...(ytdlAgent ? { agent: ytdlAgent } : {}),
-            });
-            return {
-                resource: createAudioResource(ytStream, { inputType: StreamType.Arbitrary, inlineVolume: true }),
-                display: finalUrl,
-            };
-        } catch (e) {
-            console.warn('[ytdl] failed:', e?.message || e);
+        // Try 2: ytdl-core (agent cookie, không header)
+        if (USE_YTDL_FALLBACK) {
+            try {
+                const ytStream = ytdl(finalUrl, {
+                    filter: 'audioonly',
+                    quality: 'highestaudio',
+                    highWaterMark: 1 << 25,
+                    ...(ytdlAgent ? { agent: ytdlAgent } : {}),
+                });
+                return {
+                    resource: createAudioResource(ytStream, { inputType: StreamType.Arbitrary, inlineVolume: true }),
+                    display: finalUrl,
+                };
+            } catch (e) {
+                console.warn('[ytdl] failed:', e?.message || e);
+            }
         }
 
-        // Try 3: mirror-search theo tiêu đề và stream bằng play-dl
+        // Try 3: mirror-search bằng play-dl
         try {
             const title = await fetchTitleWithTimeout(finalUrl, 1200);
             const term = (title === finalUrl) ? 'official audio' : title;
@@ -429,14 +467,13 @@ async function createResourceFromUrl(urlInput) {
     };
 }
 
-// Mở rộng URL thành danh sách (playlist YouTube/Spotify)
+// ================= expandToUrls (playlist/album/RD/Spotify) =================
 async function expandToUrls(rawUrl) {
     // YouTube
     if (/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//i.test(rawUrl) || /^(youtube\.com|youtu\.be)\//i.test(rawUrl)) {
         const { v, list } = getYTParams(rawUrl);
         if (v && !list) return [await resolveYouTubePlayableUrl(rawUrl)];
         if (list) {
-            // RD (Mix/Radio): dùng yt-dlp để expand đầy đủ
             if (/^RD/i.test(String(list))) {
                 try {
                     const urls = await expandRDWithYtDlp(normalizeYouTubeUrl(rawUrl));
@@ -446,7 +483,6 @@ async function expandToUrls(rawUrl) {
                     return seed ? [`https://www.youtube.com/watch?v=${seed}`] : [];
                 }
             }
-            // playlist chuẩn
             const pl = await play.playlist_info(normalizeYouTubeUrl(rawUrl), { incomplete: true });
             const vids = await pl.all_videos();
             return vids.map(vv => vv.url);
@@ -456,11 +492,11 @@ async function expandToUrls(rawUrl) {
     if (/^(https?:\/\/)?open\.spotify\.com\//i.test(rawUrl)) {
         return await resolveSpotifyToYoutubeUrls(rawUrl);
     }
-    // Nguồn khác
+    // Khác
     return [rawUrl];
 }
 
-// ================ State & Core ================
+// ================= State & Core =================
 /**
  * ctx: {
  *   player, connection,
@@ -491,7 +527,6 @@ function getOrCreate(guild, voiceChannel) {
         ctx = { player, connection, queue: [], now: null, textChannelId: undefined, loopMode: 'none' };
         contexts.set(guild.id, ctx);
 
-        // Hết bài → phát tiếp từ queue
         player.on(AudioPlayerStatus.Idle, async () => {
             try {
                 if (ctx.loopMode === 'one' && ctx.now) {
@@ -515,17 +550,13 @@ function getOrCreate(guild, voiceChannel) {
             }
         });
 
-        player.on('error', (err) => {
-            console.error('[PLAYER] error:', err);
-        });
+        player.on('error', (err) => console.error('[PLAYER] error:', err));
 
-        // Log khi player vào trạng thái Playing
         player.on(AudioPlayerStatus.Playing, () => {
             const titleOrUrl = ctx.now?.title || ctx.now?.url || '(unknown)';
             printNowPlaying(titleOrUrl);
         });
 
-        // Debug kết nối
         connection.on('stateChange', (o, n) => console.log('[Conn]', o.status, '->', n.status));
     }
     return ctx;
@@ -550,10 +581,8 @@ async function announceNowPlaying(client, ctx) {
 async function playOne(ctx, url, { announce = false } = {}) {
     const built = await createResourceFromUrl(url);
 
-    // gắn trước để listener Playing đọc được
     ctx.now = { url: built.display, title: undefined };
 
-    // phát trước + chặn lỗi "resource ended"
     try {
         ctx.player.play(built.resource);
     } catch (e) {
@@ -565,26 +594,17 @@ async function playOne(ctx, url, { announce = false } = {}) {
         throw e;
     }
 
-    // log lỗi stream
     built.resource.playStream?.on?.('error', err => console.error('[Stream error]', err));
 
-    // lấy tiêu đề có timeout (1.5s), nếu fail dùng URL
     let title = built.display;
-    try {
-        title = await fetchTitleWithTimeout(built.display, 1500);
-    } catch { }
+    try { title = await fetchTitleWithTimeout(built.display, 1500); } catch { }
     ctx.now.title = title;
 
-    // in ra console
     printNowPlaying(title);
-
-    // gửi thông báo (im lặng) nếu announce=true
-    if (announce) {
-        await announceNowPlaying(client, ctx);
-    }
+    if (announce) await announceNowPlaying(client, ctx);
 }
 
-// ================ Bot setup & commands ================
+// ================= Bot setup & commands =================
 const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
@@ -620,7 +640,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 ctx.textChannelId = interaction.channelId;
             }
 
-            ctx.queue.length = 0; // clear queue
+            ctx.queue.length = 0;
             await playOne(ctx, inputUrl, { announce: true });
             return interaction.editReply(`🎵 Đang phát: ${ctx.now?.title || ctx.now?.url}`);
         } catch (err) {
@@ -653,7 +673,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
             const urls = await expandToUrls(inputUrl);
 
-            // lấy sẵn tiêu đề cho 10 bài đầu để hiển thị đẹp
             const firstTitlesCount = Math.min(urls.length, 10);
             const titles = await Promise.all(urls.slice(0, firstTitlesCount).map(u => fetchTitle(u)));
             const items = urls.map((u, idx) => ({ url: u, title: idx < firstTitlesCount ? titles[idx] : undefined }));
@@ -679,7 +698,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!ctx || (!ctx.now && ctx.queue.length === 0)) {
             return interaction.reply({ content: '⏭️ Không có gì để skip.', ephemeral: true });
         }
-        ctx.player.stop(true); // Idle → auto next
+        ctx.player.stop(true);
         return interaction.reply('⏭️ Đã skip.');
     }
 
@@ -703,7 +722,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.reply(ok ? '▶️ Tiếp tục phát.' : '⚠️ Không tiếp tục được.');
     }
 
-    // /loop (none|one|all)
+    // /loop
     if (interaction.commandName === 'loop') {
         const mode = interaction.options.getString('mode', true);
         const ctx = contexts.get(guild.id);
