@@ -99,13 +99,15 @@ function getCookiesFromEnv() {
 }
 
 function getCookieFilePath() {
-    if (!cookies || !cookies.length) return null;
     try {
-        // Ghi đúng định dạng Netscape (bạn đã có writeNetscapeCookieFile)
-        return writeNetscapeCookieFile(cookies); // trả về '/tmp/youtube.netscape.cookies.txt'
-    } catch {
-        return null;
-    }
+        if (process.env.YT_NETSCAPE_COOKIE_RAW) {
+            const p = '/tmp/youtube.netscape.cookies.txt';
+            require('node:fs').writeFileSync(p, process.env.YT_NETSCAPE_COOKIE_RAW, 'utf8');
+            console.log('[YT] Netscape cookie file (raw) written:', p);
+            return p;
+        }
+    } catch { }
+    return null;
 }
 
 
@@ -422,72 +424,113 @@ async function expandRDWithYtDlp(url) {
 async function buildYtDlpAudioResource(url) {
     const cookiePath = getCookieFilePath();
 
-    // Ưu tiên audio-only HLS (233/234) rồi đến opus/m4a, cuối cùng là bestaudio
-    const FORMAT = process.env.YTDLP_FORMAT || '233/234/251/140/bestaudio[ext=m4a]/bestaudio';
-
-    // Thử lần lượt các client để né CAPTCHA/SABR
+    // Thử dần nhiều “format” và “client” để tăng tỉ lệ thành công
+    const FORMAT_TRIES = [
+        process.env.YTDLP_FORMAT || '233/234/251/140/bestaudio[ext=m4a]/bestaudio',
+        '251/140/bestaudio',        // webm opus / m4a
+        'bestaudio'                 // chốt hạ
+    ];
     const CLIENTS = (process.env.YTDLP_CLIENTS || 'ios,web,android,tv_embedded')
-        .split(',').map(s => s.trim()).filter(Boolean);
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
 
-    // Thử từng client: nếu client nào spawn ok thì dùng luôn
-    for (const client of CLIENTS) {
-        const args = [
-            '-f', FORMAT,
-            '--no-playlist',
-            '-o', '-',                  // xuất thẳng ra stdout
-            '--quiet', '--no-warnings',
-            '--geo-bypass',
-            '--force-ipv4',
-            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-            '--extractor-args', `youtube:player_client=${client}`,
-            '--retries', '3',
-            '--fragment-retries', '3',
-        ];
+    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
 
-        // ⚠️ PHẢI đặt --cookies trước URL
-        if (cookiePath) {
-            args.push('--cookies', cookiePath);
-        }
+    // Thử theo cặp (format, client) cho đến khi nhận được byte đầu tiên
+    for (const fmt of FORMAT_TRIES) {
+        for (const client of CLIENTS) {
+            const args = [
+                '-f', fmt,
+                '--no-playlist',
+                '-o', '-',
+                '--quiet', '--no-warnings',
+                '--geo-bypass',
+                '--force-ipv4',
+                '--user-agent', UA,
+                '--extractor-args', `youtube:player_client=${client}`,
+                '--retries', '3',
+                '--fragment-retries', '3',
+                url,
+            ];
+            if (cookiePath) {
+                // --cookies phải đứng TRƯỚC URL nhưng SAU các option khác đều OK
+                args.splice(args.length - 1, 0, '--cookies', cookiePath);
+            }
 
-        // ⚠️ PHẢI push URL LÀ THAM SỐ CUỐI CÙNG
-        args.push(url);
+            console.log(`[yt-dlp ${client}] spawn`, args.join(' '));
 
-        // (tuỳ chọn) log ngắn để debug thứ tự args
-        console.log(`[yt-dlp ${client}] spawn`, args.join(' '));
+            const proc = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-        // Spawn yt-dlp
-        const proc = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+            let settled = false;
+            let killed = false;
 
-        let hadData = false;
-        proc.stdout.once('data', () => { hadData = true; });
+            const gotAudioPromise = new Promise((resolve, reject) => {
+                const onStdoutData = (chunk) => {
+                    if (settled) return;
+                    // Đã nhận byte đầu tiên -> coi như thành công
+                    settled = true;
+                    proc.stderr.off('data', onStderr);
+                    clearTimeout(timer);
+                    resolve(chunk);
+                };
 
-        // Gom stderr để biết lý do nếu fail
-        let errBuf = '';
-        proc.stderr.on('data', d => {
-            const s = d.toString();
-            errBuf += s;
-            const line = s.trim();
-            if (line) console.warn(`[yt-dlp ${client}]`, line);
-        });
+                const onStderr = (d) => {
+                    // Log cảnh báo/lỗi nhưng KHÔNG reject ở đây
+                    const s = d?.toString?.() ?? '';
+                    if (s.trim()) console.warn(`[yt-dlp ${client}]`, s.trim());
+                };
 
-        // Đợi nhanh xem có dữ liệu audio không (0.8s)
-        await new Promise(res => setTimeout(res, 800));
+                const onExit = (code) => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    if (!killed && code !== 0) {
+                        reject(new Error(`yt-dlp exited ${code}`));
+                    } else {
+                        reject(new Error('yt-dlp ended before audio'));
+                    }
+                };
 
-        if (hadData) {
-            const resource = createAudioResource(proc.stdout, {
-                inputType: StreamType.Arbitrary,
-                inlineVolume: true,
+                proc.stdout.once('data', onStdoutData);
+                proc.stderr.on('data', onStderr);
+                proc.on('exit', onExit);
+                proc.on('error', (e) => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    reject(e);
+                });
+
+                // Timeout: chưa có byte nào -> thử client tiếp theo
+                const TIMEOUT_MS = Number(process.env.YTDLP_FIRSTBYTE_TIMEOUT_MS || 3500);
+                var timer = setTimeout(() => {
+                    if (settled) return;
+                    settled = true;
+                    killed = true;
+                    try { proc.kill('SIGKILL'); } catch { }
+                    reject(new Error('no audio first-byte (timeout)'));
+                }, TIMEOUT_MS);
             });
-            resource.playStream?.on?.('error', err => console.error('[yt-dlp stream error]', err));
-            return resource; // ✅ dùng client này
-        } else {
-            // Không có dữ liệu, dừng process và thử client tiếp theo
-            try { proc.kill('SIGKILL'); } catch { }
-            console.warn(`[yt-dlp ${client}] no audio yet, try next client. Reason: ${errBuf.split('\n')[0] || 'unknown'}`);
+
+            try {
+                await gotAudioPromise; // chỉ cần byte đầu tiên để biết stream đã chảy
+                // Tạo resource từ stdout hiện có của proc
+                const resource = createAudioResource(proc.stdout, {
+                    inputType: StreamType.Arbitrary,
+                    inlineVolume: true,
+                });
+                resource.playStream?.on?.('error', (err) => console.error('[yt-dlp stream error]', err));
+                console.log(`[yt-dlp ${client}] streaming with format="${fmt}"`);
+                return resource;
+            } catch (e) {
+                console.warn(`[yt-dlp ${client}] no audio yet, try next. Reason: ${e?.message || e}`);
+                try { proc.kill('SIGKILL'); } catch { }
+                // tiếp tục thử client tiếp theo
+            }
         }
     }
 
-    // Nếu không client nào phát được
     throw new Error('yt-dlp không thể mở stream audio (mọi client đều thất bại).');
 }
 
