@@ -342,20 +342,13 @@ async function expandRDWithYtDlp(url) {
     const cookiePath = cookies?.length ? writeNetscapeCookieFile(cookies) : null;
     return await new Promise((resolve, reject) => {
         const args = [
-            '-f', 'bestaudio[ext=m4a]/bestaudio/best', // thêm /best cho an toàn
-            '--no-playlist',
-            '-o', '-',
-            '--quiet', '--no-warnings', '--geo-bypass',
+            '-J', '--flat-playlist',
             '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-            '--extractor-args', 'youtube:player_client=web',
             '--force-ipv4',
             url,
         ];
 
-        if (cookiePath) {
-            // đảm bảo tất cả option đứng TRƯỚC url
-            args.unshift('--cookies', cookiePath);
-        } // chèn sau -J
+        if (cookiePath) args.unshift('--cookies', cookiePath);
         execFile(
             YTDLP_BIN,
             args,
@@ -380,26 +373,24 @@ async function expandRDWithYtDlp(url) {
 // ============== Stream trực tiếp bằng yt-dlp (stdout) ==============
 function buildYtDlpAudioResource(url) {
     const cookiePath = cookies?.length ? writeNetscapeCookieFile(cookies) : null;
+
+    const YT_CLIENT = process.env.YTDLP_CLIENT || 'android'; // 'android' | 'web' | 'ios' | 'tv_embedded'
+    const YT_FORMAT = process.env.YTDLP_FORMAT || 'ba[ext=m4a]/ba[acodec^=mp4a]/ba/best';
+
     const args = [
-        '-f',
-        'bestaudio[ext=m4a]/bestaudio',
+        '-f', YT_FORMAT,           // format rộng: thử m4a, rồi mp4a, rồi bestaudio/best
         '--no-playlist',
-        '-o',
-        '-',
-        '--quiet',
-        '--no-warnings',
+        '-o', '-',                 // stdout
+        '--quiet', '--no-warnings',
         '--geo-bypass',
-        '--user-agent',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-        '--extractor-args',
-        'youtube:player_client=web',
         '--force-ipv4',
+        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+        '--extractor-args', `youtube:player_client=${YT_CLIENT}`,
+        '--retry-streams', '3',
+        '--fragment-retries', '3',
         url,
     ];
-    if (cookiePath) {
-        args.unshift('--cookies', cookiePath);
-    }
-
+    if (cookiePath) args.unshift('--cookies', cookiePath); // NHỚ: chèn trước URL
 
     const proc = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     proc.on('error', (e) => console.error('[yt-dlp spawn error]', e));
@@ -412,7 +403,6 @@ function buildYtDlpAudioResource(url) {
         inputType: StreamType.Arbitrary,
         inlineVolume: true,
     });
-
     resource.playStream?.on?.('error', (err) => console.error('[yt-dlp stream error]', err));
     return resource;
 }
