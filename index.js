@@ -378,19 +378,19 @@ function buildYtDlpAudioResource(url) {
     const YT_FORMAT = process.env.YTDLP_FORMAT || 'ba[ext=m4a]/ba[acodec^=mp4a]/ba/best';
 
     const args = [
-        '-f', YT_FORMAT,           // format rộng: thử m4a, rồi mp4a, rồi bestaudio/best
+        '-f', YT_FORMAT,
         '--no-playlist',
-        '-o', '-',                 // stdout
+        '-o', '-',
         '--quiet', '--no-warnings',
         '--geo-bypass',
         '--force-ipv4',
         '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
         '--extractor-args', `youtube:player_client=${YT_CLIENT}`,
-        '--retry-streams', '3',
+        '--retries', '3',
         '--fragment-retries', '3',
         url,
     ];
-    if (cookiePath) args.unshift('--cookies', cookiePath); // NHỚ: chèn trước URL
+    if (cookiePath) args.unshift('--cookies', cookiePath); // chèn trước URL
 
     const proc = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     proc.on('error', (e) => console.error('[yt-dlp spawn error]', e));
@@ -403,9 +403,11 @@ function buildYtDlpAudioResource(url) {
         inputType: StreamType.Arbitrary,
         inlineVolume: true,
     });
+
     resource.playStream?.on?.('error', (err) => console.error('[yt-dlp stream error]', err));
     return resource;
 }
+
 
 // ================= Spotify helpers =================
 const spotify = new SpotifyWebApi({
@@ -788,11 +790,16 @@ async function playOne(ctx, url, { announce = false } = {}) {
     let title = built.display;
     try {
         title = await fetchTitleWithTimeout(built.display, 1500);
-    } catch { }
-    ctx.now.title = title;
+    } catch {}
+
+    // CHỈ gán nếu ctx.now vẫn còn và đang phát đúng URL này
+    if (ctx.now && ctx.now.url === built.display) {
+        ctx.now.title = title;
+    }
 
     printNowPlaying(title);
     if (announce) await announceNowPlaying(client, ctx);
+
 }
 
 // ================= Bot setup & commands =================
