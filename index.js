@@ -563,9 +563,23 @@ async function expandToUrls(rawUrl) {
                     return radio;
                 }
             }
-            const pl = await play.playlist_info(normalizeYouTubeUrl(rawUrl), { incomplete: true });
-            const vids = await pl.all_videos();
-            return vids.map(vv => vv?.url).filter(u => typeof u === 'string' && u.startsWith('http'));
+            // Playlist thường (PL/LL/WL...): ép về URL playlist chuẩn, bỏ si/index/... để play-dl dễ ăn
+            const canonical = `https://www.youtube.com/playlist?list=${list}`;
+            try {
+                const pl = await play.playlist_info(canonical, { incomplete: true });
+                const vids = await pl.all_videos();
+                const urls1 = vids.map(vv => vv?.url).filter(u => typeof u === 'string' && u.startsWith('http'));
+                // Dedupe lần nữa phòng play-dl trả trùng
+                return Array.from(new Set(urls1));
+            } catch (e) {
+                console.warn('[play-dl playlist] failed -> fallback yt-dlp:', e?.message || e);
+                // Fallback bằng yt-dlp cho playlist thường
+                const urls2 = (await expandRDWithYtDlp(canonical))
+                    .filter(u => typeof u === 'string' && u.startsWith('http'));
+                if (urls2.length) return Array.from(new Set(urls2));
+                // Nếu vẫn không có gì, trả về rỗng để /queue báo lỗi gọn
+                return [];
+            }
         }
     }
     // Spotify
@@ -761,7 +775,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
             }
 
             const urlsRaw = await expandToUrls(inputUrl);
-            const urls = (urlsRaw || []).filter(u => typeof u === 'string' && u.startsWith('http'));
+            const urls = Array.from(new Set(
+                (urlsRaw || []).filter(u => typeof u === 'string' && u.startsWith('http'))
+            ));
             if (urls.length === 0) {
                 return interaction.editReply('❌ Không lấy được URL hợp lệ từ liên kết này.');
             }
@@ -857,7 +873,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const perPage = 10;
 
         const startIndex = (Math.max(1, page) - 1) * perPage;
-        const slice = ctx.queue.slice(startIndex, startIndex + perPage);
+        const slice = ctx.queue.slice(startIndex, startIndex + perPage).filter(Boolean);
 
         await Promise.all(slice.map(async (item) => {
             if (!item.title) item.title = await fetchTitle(item.url);
