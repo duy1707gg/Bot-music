@@ -26,23 +26,45 @@ import { writeFileSync } from 'node:fs';
 import play from 'play-dl';
 import SpotifyWebApi from 'spotify-web-api-node';
 
-// -------- Config & helpers for binaries / headers ----------
-const DEFAULT_YTDLP_BIN = process.env.YTDLP_BIN || '/usr/local/bin/yt-dlp';
-const YTDLP_BIN = DEFAULT_YTDLP_BIN || 'yt-dlp';
+// ====== Cấu hình nhị phân yt-dlp ======
+const YTDLP_BIN = process.env.YTDLP_BIN || '/usr/local/bin/yt-dlp';
 
-function ytHeaders() {
-    const headers = { 'user-agent': 'Mozilla/5.0' };
-    if (process.env.YT_COOKIE) headers.cookie = process.env.YT_COOKIE;
-    return headers;
-}
-
-// (tuỳ chọn) nạp cookie vào play-dl để giảm CAPTCHA khi stream
+// ====== Cookie cho play-dl (tùy chọn) ======
 if (process.env.YT_COOKIE) {
     try {
         await play.setToken({ youtube: { cookie: process.env.YT_COOKIE } });
         console.log('[YT] cookie loaded for play-dl');
     } catch (e) {
         console.warn('[YT] failed to set cookie for play-dl:', e?.message || e);
+    }
+}
+
+// ====== Cookie agent cho ytdl-core (định dạng mới) ======
+function parseCookieHeaderToArray(str) {
+    // Hỗ trợ chuỗi: "NAME=VAL; NAME2=VAL2; ..."
+    return String(str)
+        .split(';')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(pair => {
+            const eq = pair.indexOf('=');
+            const name = eq === -1 ? pair : pair.slice(0, eq);
+            const value = eq === -1 ? '' : pair.slice(eq + 1);
+            return { name, value };
+        });
+}
+
+let ytdlAgent = undefined;
+if (process.env.YT_COOKIE) {
+    try {
+        const raw = process.env.YT_COOKIE.trim();
+        const cookies = raw.startsWith('[')
+            ? JSON.parse(raw)                // JSON export (khuyến nghị)
+            : parseCookieHeaderToArray(raw); // fallback chuỗi "a=b; c=d"
+        ytdlAgent = ytdl.createAgent(cookies);
+        console.log('[YT] ytdl agent đã khởi tạo với cookie');
+    } catch (e) {
+        console.warn('[YT] lỗi tạo agent từ YT_COOKIE:', e?.message || e);
     }
 }
 
@@ -285,11 +307,9 @@ async function fetchTitle(url) {
             const info = await play.video_basic_info(url).catch(() => null);
             if (info?.video_details?.title) return info.video_details.title;
         }
-        // Fallback ytdl (kèm cookie & UA)
+        // Fallback ytdl-core (dùng agent cookie mới)
         if (ytdl.validateURL(url)) {
-            const info = await ytdl.getBasicInfo(url, {
-                requestOptions: { headers: ytHeaders() },
-            });
+            const info = await ytdl.getBasicInfo(url, ytdlAgent ? { agent: ytdlAgent } : undefined);
             return info?.videoDetails?.title || url;
         }
     } catch (_) { }
@@ -349,13 +369,13 @@ async function createResourceFromUrl(urlInput) {
             console.warn('[play-dl] direct stream failed, fallback ytdl:', e?.message || e);
         }
 
-        // Try 2: ytdl (KÈM COOKIE + UA để tránh “Sign in to confirm...”)
+        // Try 2: ytdl-core (DÙNG AGENT COOKIE, KHÔNG NHÉT HEADER)
         try {
             const ytStream = ytdl(finalUrl, {
                 filter: 'audioonly',
                 quality: 'highestaudio',
                 highWaterMark: 1 << 25,
-                requestOptions: { headers: ytHeaders() },
+                ...(ytdlAgent ? { agent: ytdlAgent } : {}),
             });
             return {
                 resource: createAudioResource(ytStream, { inputType: StreamType.Arbitrary, inlineVolume: true }),
@@ -496,7 +516,6 @@ function getOrCreate(guild, voiceChannel) {
         });
 
         player.on('error', (err) => {
-            // Lưu ý: nhiều lỗi do YouTube yêu cầu xác minh -> đã bọc cookie ở trên
             console.error('[PLAYER] error:', err);
         });
 
