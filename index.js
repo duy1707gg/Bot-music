@@ -342,16 +342,20 @@ async function expandRDWithYtDlp(url) {
     const cookiePath = cookies?.length ? writeNetscapeCookieFile(cookies) : null;
     return await new Promise((resolve, reject) => {
         const args = [
-            '-J',
-            '--flat-playlist',
-            '--user-agent',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-            '--extractor-args',
-            'youtube:player_client=web',
+            '-f', 'bestaudio[ext=m4a]/bestaudio/best', // thêm /best cho an toàn
+            '--no-playlist',
+            '-o', '-',
+            '--quiet', '--no-warnings', '--geo-bypass',
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+            '--extractor-args', 'youtube:player_client=web',
             '--force-ipv4',
             url,
         ];
-        if (cookiePath) args.splice(1, 0, '--cookies', cookiePath); // chèn sau -J
+
+        if (cookiePath) {
+            // đảm bảo tất cả option đứng TRƯỚC url
+            args.unshift('--cookies', cookiePath);
+        } // chèn sau -J
         execFile(
             YTDLP_BIN,
             args,
@@ -392,7 +396,10 @@ function buildYtDlpAudioResource(url) {
         '--force-ipv4',
         url,
     ];
-    if (cookiePath) args.splice(1, 0, '--cookies', cookiePath);
+    if (cookiePath) {
+        args.unshift('--cookies', cookiePath);
+    }
+
 
     const proc = spawn(YTDLP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     proc.on('error', (e) => console.error('[yt-dlp spawn error]', e));
